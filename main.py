@@ -2,9 +2,12 @@ import os
 import logging
 from typing import Optional, List
 
+import re
 import discord
 from discord import app_commands
+from discord.ext import commands
 import asyncpg
+
 
 # ─────────────────────────────
 # 環境変数
@@ -28,10 +31,17 @@ log = logging.getLogger("yado-bot")
 #   Developer Portal > Bot > Privileged Gateway Intents で
 #   "MESSAGE CONTENT INTENT" を ON にしてください。
 # ─────────────────────────────
-intents = discord.Intents.none()
+intents = discord.Intents.default()
 intents.guilds = True
+intents.members = True
 intents.messages = True
-intents.message_content = True  # 重要：本文取得に必要
+intents.message_content = True
+
+# 既存を流用
+client = discord.Client(intents=intents)        # ← 既にある行をこの形に
+tree = app_commands.CommandTree(client)         # ← 既にあるならそのまま
+
+
 
 # ─────────────────────────────
 # Botクラス
@@ -121,6 +131,34 @@ async def find_latest_intro_message(
         if msg.author.id == user_id:
             return msg
     return None
+
+# ==== /hlt xp 用ユーティリティ ====
+XP_CHANNEL_CANDIDATES = ["XP募集", "xp募集", "xp-募集", "ｘｐ募集"]
+
+ZEN2HAN_TABLE = str.maketrans("０１２３４５６７８９．，－", "0123456789.-")
+NUM_PATTERN = re.compile(r"(-?\d+(?:\.\d+)?)")
+
+def _normalize_num_text(text: str) -> str:
+    return text.translate(ZEN2HAN_TABLE).replace(",", "")
+
+async def _find_xp_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    lowers = [c.lower() for c in XP_CHANNEL_CANDIDATES]
+    for ch in guild.text_channels:
+        if ch.name.lower() in lowers:
+            return ch
+    return None
+
+async def _latest_number_for_user(
+    channel: discord.TextChannel, user_id: int, limit: int = 1000
+) -> str | None:
+    async for msg in channel.history(limit=limit, oldest_first=False):
+        if msg.author.id != user_id:
+            continue
+        m = NUM_PATTERN.search(_normalize_num_text(msg.content))
+        if m:
+            return m.group(1)
+    return None
+
 
 # ─────────────────────────────
 # /hlt set-intro  … 管理者用：自己紹介チャンネルを登録
@@ -257,6 +295,43 @@ async def hlt_intro(interaction: discord.Interaction, user: discord.User):
     )
 
 # ─────────────────────────────
+# /hlt xp
+# ─────────────────────────────
+hlt_group = app_commands.Group(name="hlt", description="Healths helper commands")
+
+@hlt_group.command(
+    name="xp",
+    description="『XP募集』チャンネルから指定ユーザーの最新数値を取得します。",
+)
+@app_commands.describe(user="対象ユーザー（サーバーメンバー）")
+async def hlt_xp(interaction: discord.Interaction, user: discord.Member):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+
+    xp_ch = await _find_xp_channel(guild)
+    if xp_ch is None:
+        await interaction.response.send_message("『XP募集』チャンネルが見つかりません。", ephemeral=True)
+        return
+
+    # Botに閲覧/履歴権限があるか軽チェック
+    me = guild.me or guild.get_member(interaction.client.user.id)  # type: ignore
+    if not xp_ch.permissions_for(me).read_message_history:
+        await interaction.response.send_message("『XP募集』の履歴を読めません（権限不足）。", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    number = await _latest_number_for_user(xp_ch, user.id, limit=1000)
+    if number is None:
+        await interaction.followup.send(f"{user.display_name} さんの記入が見つかりませんでした。")
+    else:
+        await interaction.followup.send(f"XP {number}")
+
+# 既存の tree にグループを登録
+tree.add_command(hlt_group)
+
+# ─────────────────────────────
 # /hlt help
 # ─────────────────────────────
 @hlt.command(name="help", description="コマンドの使い方を表示します。")
@@ -299,6 +374,19 @@ async def on_guild_join(guild: discord.Guild):
                 log.info("Auto-registered intro channel for guild %s: #%s", guild.id, chosen.name)
     except Exception as e:
         log.warning("on_guild_join auto-set failed for guild %s: %s", guild.id, e)
+
+# ─────────────────────────────
+# on_ready イベント
+# ─────────────────────────────
+@client.event
+async def on_ready():
+    try:
+        await tree.sync()
+        print("✅ Slash commands synced")
+    except Exception as e:
+        print(f"❌ Slash sync failed: {e}")
+    print(f"🔗 Logged in as {client.user}")
+
 
 # ─────────────────────────────
 # エントリーポイント
