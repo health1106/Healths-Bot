@@ -345,31 +345,10 @@ async def hlt_help(interaction: discord.Interaction):
 # ─────────────────────────────
 # イベント
 # ─────────────────────────────
-# ─────────────────────────────
-# イベント
-# ─────────────────────────────
 @client.event
 async def on_ready():
     # setup_hook() で sync 済みなのでログだけでOK
     log.info("Logged in as %s (ID: %s)", client.user, client.user.id)
-
-@client.event
-async def on_guild_join(guild: discord.Guild):
-    # 参加直後に自己紹介チャンネルを軽く推測（未設定なら）
-    try:
-        existing = await get_intro_channel_id(guild.id)
-        if existing:
-            return
-        candidates = [ch for ch in guild.text_channels if looks_like_intro_name(ch.name)]
-        if candidates:
-            chosen = sorted(candidates, key=lambda c: c.position)[0]
-            if client.pool:
-                await set_intro_channel(guild.id, chosen.id)
-                log.info("Auto-registered intro channel for guild %s: #%s", guild.id, chosen.name)
-    except Exception as e:
-        log.warning("on_guild_join auto-set failed for guild %s: %s", guild.id, e)
-
-
 
 @client.event
 async def on_guild_join(guild: discord.Guild):
