@@ -290,9 +290,6 @@ async def hlt_intro(interaction: discord.Interaction, user: discord.User):
     )
 
 # ─────────────────────────────
-# /hlt xp
-# ─────────────────────────────
-# ─────────────────────────────
 # /hlt xp  … XP募集から数値取得（既存の hlt グループに統合）
 # ─────────────────────────────
 @hlt.command(
@@ -323,7 +320,8 @@ async def hlt_xp(interaction: discord.Interaction, user: discord.Member):
     if number is None:
         await interaction.followup.send(f"{user.display_name} さんの記入が見つかりませんでした。")
     else:
-        await interaction.followup.send(f"XP {number}")
+        await interaction.followup.send(f"{user.display_name} さん: XP {number}")
+
 
 
 # ─────────────────────────────
