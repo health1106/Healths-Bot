@@ -5,7 +5,6 @@ from typing import Optional, List
 import re
 import discord
 from discord import app_commands
-from discord.ext import commands
 import asyncpg
 
 
@@ -36,11 +35,6 @@ intents.guilds = True
 intents.members = True
 intents.messages = True
 intents.message_content = True
-
-# 既存を流用
-client = discord.Client(intents=intents)        # ← 既にある行をこの形に
-tree = app_commands.CommandTree(client)         # ← 既にあるならそのまま
-
 
 
 # ─────────────────────────────
@@ -297,11 +291,12 @@ async def hlt_intro(interaction: discord.Interaction, user: discord.User):
 # ─────────────────────────────
 # /hlt xp
 # ─────────────────────────────
-hlt_group = app_commands.Group(name="hlt", description="Healths helper commands")
-
-@hlt_group.command(
+# ─────────────────────────────
+# /hlt xp  … XP募集から数値取得（既存の hlt グループに統合）
+# ─────────────────────────────
+@hlt.command(
     name="xp",
-    description="『XP募集』チャンネルから指定ユーザーの最新数値を取得します。",
+    description="『XP募集』チャンネルから指定ユーザーの最新数値を取得します。"
 )
 @app_commands.describe(user="対象ユーザー（サーバーメンバー）")
 async def hlt_xp(interaction: discord.Interaction, user: discord.Member):
@@ -317,7 +312,8 @@ async def hlt_xp(interaction: discord.Interaction, user: discord.Member):
 
     # Botに閲覧/履歴権限があるか軽チェック
     me = guild.me or guild.get_member(interaction.client.user.id)  # type: ignore
-    if not xp_ch.permissions_for(me).read_message_history:
+    perms = xp_ch.permissions_for(me)
+    if not (perms.view_channel and perms.read_messages and perms.read_message_history):
         await interaction.response.send_message("『XP募集』の履歴を読めません（権限不足）。", ephemeral=True)
         return
 
@@ -328,8 +324,6 @@ async def hlt_xp(interaction: discord.Interaction, user: discord.Member):
     else:
         await interaction.followup.send(f"XP {number}")
 
-# 既存の tree にグループを登録
-tree.add_command(hlt_group)
 
 # ─────────────────────────────
 # /hlt help
@@ -342,6 +336,7 @@ async def hlt_help(interaction: discord.Interaction):
         "`/hlt auto` …（管理者）自己紹介チャンネルを自動検出して登録\n"
         "`/hlt config` … 現在の設定を表示\n"
         "`/hlt intro @ユーザー` … 登録チャンネルから、指定ユーザーの最新自己紹介を呼び出す\n\n"
+        "`/hlt xp @ユーザー` … 『XP募集』からそのユーザーの最新の数値を取得\n\n"
         "※ Botには「View Channel」「Read Message History」「Send Messages」「Embed Links」「Attach Files」の権限が必要です。\n"
         "※ メッセージ本文を取得するには Developer Portal で **MESSAGE CONTENT INTENT** をONにしてください。"
     )
@@ -350,14 +345,13 @@ async def hlt_help(interaction: discord.Interaction):
 # ─────────────────────────────
 # イベント
 # ─────────────────────────────
+# ─────────────────────────────
+# イベント
+# ─────────────────────────────
 @client.event
 async def on_ready():
+    # setup_hook() で sync 済みなのでログだけでOK
     log.info("Logged in as %s (ID: %s)", client.user, client.user.id)
-    try:
-        synced = await client.tree.sync()
-        log.info("Slash commands synced: %d", len(synced))
-    except Exception as e:
-        log.exception("Command sync error: %s", e)
 
 @client.event
 async def on_guild_join(guild: discord.Guild):
@@ -375,18 +369,23 @@ async def on_guild_join(guild: discord.Guild):
     except Exception as e:
         log.warning("on_guild_join auto-set failed for guild %s: %s", guild.id, e)
 
-# ─────────────────────────────
-# on_ready イベント
-# ─────────────────────────────
-@client.event
-async def on_ready():
-    try:
-        await tree.sync()
-        print("✅ Slash commands synced")
-    except Exception as e:
-        print(f"❌ Slash sync failed: {e}")
-    print(f"🔗 Logged in as {client.user}")
 
+
+@client.event
+async def on_guild_join(guild: discord.Guild):
+    # 参加直後に自己紹介チャンネルを軽く推測（未設定なら）
+    try:
+        existing = await get_intro_channel_id(guild.id)
+        if existing:
+            return
+        candidates = [ch for ch in guild.text_channels if looks_like_intro_name(ch.name)]
+        if candidates:
+            chosen = sorted(candidates, key=lambda c: c.position)[0]
+            if client.pool:
+                await set_intro_channel(guild.id, chosen.id)
+                log.info("Auto-registered intro channel for guild %s: #%s", guild.id, chosen.name)
+    except Exception as e:
+        log.warning("on_guild_join auto-set failed for guild %s: %s", guild.id, e)
 
 # ─────────────────────────────
 # エントリーポイント
