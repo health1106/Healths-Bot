@@ -129,7 +129,8 @@ async def find_latest_intro_message(
 # ==== /hlt xp 用ユーティリティ ====
 XP_CHANNEL_CANDIDATES = ["XP募集", "xp募集", "xp-募集", "ｘｐ募集"]
 
-ZEN2HAN_TABLE = str.maketrans("０１２３４５６７８９．，－", "0123456789.-")
+ZEN2HAN_TABLE = str.maketrans("０１２３４５６７８９．，－", "0123456789.,-")
+
 NUM_PATTERN = re.compile(r"(-?\d+(?:\.\d+)?)")
 
 def _normalize_num_text(text: str) -> str:
