@@ -298,31 +298,45 @@ async def hlt_intro(interaction: discord.Interaction, user: discord.User):
 )
 @app_commands.describe(user="対象ユーザー（サーバーメンバー）")
 async def hlt_xp(interaction: discord.Interaction, user: discord.Member):
+    import asyncio
+
+    # ❶ 最初に必ず defer（以後は followup.send に統一）
+    await interaction.response.defer(thinking=True)
+
     guild = interaction.guild
     if guild is None:
-        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        await interaction.followup.send("サーバー内で実行してください。", ephemeral=True)
         return
 
     xp_ch = await _find_xp_channel(guild)
     if xp_ch is None:
-        await interaction.response.send_message("『XP募集』チャンネルが見つかりません。", ephemeral=True)
+        await interaction.followup.send("『XP募集』チャンネルが見つかりません。", ephemeral=True)
         return
 
-    # Botに閲覧/履歴権限があるか軽チェック
     me = guild.me or guild.get_member(interaction.client.user.id)  # type: ignore
     perms = xp_ch.permissions_for(me)
     if not (perms.view_channel and perms.read_messages and perms.read_message_history):
-        await interaction.response.send_message("『XP募集』の履歴を読めません（権限不足）。", ephemeral=True)
+        await interaction.followup.send("『XP募集』の履歴を読めません（権限不足）。", ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
-    number = await _latest_number_for_user(xp_ch, user.id, limit=1000)
+    # ❷ 履歴スキャンにタイムアウトを付与（Unknown interactionの予防）
+    async def _scan():
+        return await _latest_number_for_user(xp_ch, user.id, limit=600)
+
+    try:
+        number = await asyncio.wait_for(_scan(), timeout=7)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("検索に時間がかかりすぎました。後でもう一度お試しください。", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"検索中にエラー: {e}", ephemeral=True)
+        return
+
+    # ❸ 出力（ご希望どおりユーザー名を前に）
     if number is None:
         await interaction.followup.send(f"{user.display_name} さんの記入が見つかりませんでした。")
     else:
         await interaction.followup.send(f"{user.display_name} さん: XP {number}")
-
-
 
 # ─────────────────────────────
 # /hlt help
