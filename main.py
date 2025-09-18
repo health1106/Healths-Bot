@@ -6,12 +6,6 @@ import re
 import math
 import collections
 import discord
-
-# メンション通知を完全に抑止（ユーザー/ロール/@everyone、返信通知もオフ）
-ALLOWED_NONE = discord.AllowedMentions(
-    everyone=False, roles=False, users=False, replied_user=False
-)
-
 from discord import app_commands
 import asyncpg
 
@@ -46,6 +40,12 @@ intents.message_content = True
 # イベントランキングに必要
 intents.guild_scheduled_events = True
 
+# ─────────────────────────────
+# メンション抑止（@通知を飛ばさない）
+# ─────────────────────────────
+ALLOWED_NONE = discord.AllowedMentions(
+    everyone=False, roles=False, users=False, replied_user=False
+)
 
 # ─────────────────────────────
 # Botクラス
@@ -342,17 +342,17 @@ async def hlt_xp(interaction: discord.Interaction, user: discord.Member):
         await interaction.followup.send(f"検索中にエラー: {e}", ephemeral=True)
         return
 
-    # ❸ 出力（ご希望どおりユーザー名を前に）
+    # ❸ 出力（display_nameはメンションではないため通知されません）
     if number is None:
         await interaction.followup.send(f"{user.display_name} さんの記入が見つかりませんでした。")
     else:
         await interaction.followup.send(f"{user.display_name} さん: XP {number}")
 
-
 # ─────────────────────────────
-# ==== イベントランキング 追加 ====
-#   /hlt eventrank : このサーバー限定
-#   10位ごとにページ分割、◀️ ▶️ ⏹️ でページ切替
+# ==== イベントランキング（ユーザー指定対応） ====
+#   /hlt eventrank [@ユーザー]
+#   ユーザー未指定: ランキング（10位/ページ、◀️▶️⏹️）
+#   ユーザー指定  : その人の件数を数値で表示
 # ─────────────────────────────
 
 EMOJI_PREV = "◀️"
@@ -400,6 +400,7 @@ def _build_eventrank_pages(guild: discord.Guild, ranking: list[tuple[int, int]],
         )
         lines = []
         for idx, (uid, cnt) in enumerate(chunk, start=start + 1):
+            # メンション抑止のため allowed_mentions=ALLOWED_NONE を送信側で使用
             lines.append(f"{idx}. <@{uid}> — **{cnt} 件**")
         footer = f"\nページ {i+1}/{total_pages}｜対象メンバー数: {total}"
         pages.append(header + "\n".join(lines) + footer)
@@ -407,10 +408,11 @@ def _build_eventrank_pages(guild: discord.Guild, ranking: list[tuple[int, int]],
 
 @hlt.command(
     name="eventrank",
-    description="このサーバー内で『興味あり』を押した回数のメンバー別ランキングを表示（10位ごと・リアクションでページ送り）"
+    description="サーバー内イベントの『興味あり』回数ランキングを表示。または指定ユーザーの件数を表示。"
 )
-async def hlt_eventrank(interaction: discord.Interaction):
-    # リアクションでページ送りするので、公開メッセージで返す（ephemeral不可）
+@app_commands.describe(user="対象ユーザー（指定すると件数のみ表示）")
+async def hlt_eventrank(interaction: discord.Interaction, user: discord.Member | None = None):
+    # ランキングはページ送り（リアクション操作）するので公開メッセージで返す（ephemeral不可）
     await interaction.response.defer(thinking=True)
 
     guild = interaction.guild
@@ -424,31 +426,42 @@ async def hlt_eventrank(interaction: discord.Interaction):
         await interaction.followup.send("内部エラー：Botメンバーを確認できませんでした。", ephemeral=True)
         return
 
-    # 最低限：送信できること
     if not interaction.channel:
         await interaction.followup.send("チャンネルを取得できませんでした。", ephemeral=True)
         return
     ch_perms = interaction.channel.permissions_for(me)  # type: ignore
-    if not (ch_perms.send_messages and ch_perms.add_reactions and ch_perms.read_message_history and ch_perms.view_channel):
-        await interaction.followup.send("権限不足：Send Messages / Add Reactions / Read Message History / View Channel が必要です。", ephemeral=True)
+    if not (ch_perms.send_messages and ch_perms.read_message_history and ch_perms.view_channel):
+        await interaction.followup.send("権限不足：Send Messages / Read Message History / View Channel が必要です。", ephemeral=True)
         return
 
-    # ランキング作成
+    # ランキングデータ作成（共通）
     ranking = await _build_event_interest_ranking_for_guild(guild)
+
+    # --- ユーザー指定あり：件数のみ数値で表示 ---
+    if user is not None:
+        count = next((c for uid, c in ranking if uid == user.id), 0)
+        await interaction.followup.send(
+            f"{user.display_name} さんがこのサーバーで『興味あり』を押した回数は **{count} 件** です。",
+            allowed_mentions=ALLOWED_NONE
+        )
+        return
+
+    # --- ユーザー未指定：従来のランキング（10位/ページ、リアクションでページ送り） ---
     pages = _build_eventrank_pages(guild, ranking, page_size=10)
     page_index = 0
 
-    # 送信
-    msg = await interaction.followup.send(pages[page_index])
+    msg = await interaction.followup.send(pages[page_index], allowed_mentions=ALLOWED_NONE)
 
-    # ページングが必要ならリアクション付与
-    if len(pages) > 1:
+    if len(pages) > 1 and ch_perms.add_reactions:
         try:
             await msg.add_reaction(EMOJI_PREV)
             await msg.add_reaction(EMOJI_NEXT)
             await msg.add_reaction(EMOJI_STOP)
         except discord.Forbidden:
-            await msg.edit(content=pages[page_index] + "\n\n（※Botにリアクション追加権限がないためページ送りは無効です）")
+            await msg.edit(
+                content=pages[page_index] + "\n\n（※Botにリアクション追加権限がないためページ送りは無効です）",
+                allowed_mentions=ALLOWED_NONE
+            )
             return
 
         def check(payload: discord.RawReactionActionEvent):
@@ -469,7 +482,7 @@ async def hlt_eventrank(interaction: discord.Interaction):
                 break
 
             emoji = str(payload.emoji)
-            # 押した人のリアクションは毎回外しておく
+            # 押した人のリアクションは毎回外す（視認性）
             try:
                 await msg.remove_reaction(emoji, discord.Object(id=payload.user_id))
             except discord.Forbidden:
@@ -483,11 +496,10 @@ async def hlt_eventrank(interaction: discord.Interaction):
                 break
             elif emoji == EMOJI_PREV:
                 page_index = (page_index - 1) % len(pages)
-                await msg.edit(content=pages[page_index])
+                await msg.edit(content=pages[page_index], allowed_mentions=ALLOWED_NONE)
             elif emoji == EMOJI_NEXT:
                 page_index = (page_index + 1) % len(pages)
-                await msg.edit(content=pages[page_index])
-
+                await msg.edit(content=pages[page_index], allowed_mentions=ALLOWED_NONE)
 
 # ─────────────────────────────
 # /hlt help
@@ -501,8 +513,9 @@ async def hlt_help(interaction: discord.Interaction):
         "`/hlt config` … 現在の設定を表示\n"
         "`/hlt intro @ユーザー` … 登録チャンネルから、指定ユーザーの最新自己紹介を呼び出す\n\n"
         "`/hlt xp @ユーザー` … 『XP募集』からそのユーザーの最新の数値を取得\n"
-        "`/hlt eventrank` … このサーバーのイベントで『興味あり』を押した回数のランキング（10位/ページ、リアクションで操作）\n\n"
-        "※ Botには「View Channel」「Read Message History」「Send Messages」「Embed Links」「Attach Files」「Add Reactions」の権限が必要です。\n"
+        "`/hlt eventrank` … このサーバーのイベントで『興味あり』回数のランキング（10位/ページ、リアクションで操作）\n"
+        "`/hlt eventrank @ユーザー` … 指定ユーザーが『興味あり』を押した回数（数値のみ）を表示\n\n"
+        "※ Botには「View Channel」「Read Message History」「Send Messages」「Embed Links」「Attach Files」「Add Reactions（推奨）」「Manage Messages（任意）」の権限が必要です。\n"
         "※ メッセージ本文を取得するには Developer Portal で **MESSAGE CONTENT INTENT** をONにしてください。"
     )
     await interaction.response.send_message(text, ephemeral=True)
