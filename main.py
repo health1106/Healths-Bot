@@ -2,18 +2,15 @@ import os
 import logging
 from typing import Optional, List
 
-import re
 import math
 import collections
 import discord
 from discord import app_commands
 import asyncpg
 
-
 # ─────────────────────────────
 # 環境変数
 # ─────────────────────────────
-
 TOKEN = os.getenv("DISCORD_TOKEN")         # Discord Botトークン
 DATABASE_URL = os.getenv("DATABASE_URL")   # RenderのPostgreSQL接続文字列
 
@@ -28,17 +25,13 @@ log = logging.getLogger("yado-bot")
 
 # ─────────────────────────────
 # Intents
-# ※ 自己紹介メッセージの本文を読むために message_content を有効化。
-#   Developer Portal > Bot > Privileged Gateway Intents で
-#   "MESSAGE CONTENT INTENT" を ON にしてください。
 # ─────────────────────────────
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.messages = True
-intents.message_content = True
-# イベントランキングに必要
-intents.guild_scheduled_events = True
+intents.message_content = True          # /hlt xp で本文検索に必要
+intents.guild_scheduled_events = True   # eventrank に必要
 
 # ─────────────────────────────
 # メンション抑止（@通知を飛ばさない）
@@ -55,9 +48,11 @@ class YadoBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.pool: Optional[asyncpg.Pool] = None
+        # ── 追加：ギルドごとの XP 参照チャンネル（メモリ保持のシンプル実装）
+        self.xp_channels: dict[int, int] = {}
 
     async def setup_hook(self):
-        # DB接続とテーブル作成
+        # DB接続とテーブル作成（自己紹介設定用）
         if not DATABASE_URL:
             log.warning("DATABASE_URL が未設定です。DBを使うコマンドは失敗します。")
         else:
@@ -78,7 +73,7 @@ client = YadoBot()
 # ─────────────────────────────
 # スラッシュコマンド（/hlt グループ）
 # ─────────────────────────────
-hlt = app_commands.Group(name="hlt", description="自己紹介ヘルパー")
+hlt = app_commands.Group(name="hlt", description="ヘルパーコマンド集")
 client.tree.add_command(hlt)
 
 def _is_admin_or_manager(interaction: discord.Interaction) -> bool:
@@ -93,7 +88,7 @@ def admin_only():
     return app_commands.check(predicate)
 
 # ─────────────────────────────
-# 便利関数
+# 便利関数（自己紹介設定用）
 # ─────────────────────────────
 async def set_intro_channel(guild_id: int, channel_id: int):
     assert client.pool is not None
@@ -120,7 +115,6 @@ def looks_like_intro_name(name: str) -> bool:
     if not name:
         return False
     n = name.lower()
-    # 自己紹介っぽい名前をゆるく判定
     return any(key in n for key in [
         "自己紹介", "introduc", "intro", "self-intro", "自己紹介部屋", "はじめまして", "自己紹介チャンネル"
     ])
@@ -130,43 +124,13 @@ async def find_latest_intro_message(
     user_id: int,
     search_limit: int = 800
 ) -> Optional[discord.Message]:
-    # 新しい順に走査して最初に見つかったものを返す
     async for msg in channel.history(limit=search_limit, oldest_first=False):
         if msg.author.id == user_id:
             return msg
     return None
 
-# ==== /hlt xp 用ユーティリティ ====
-XP_CHANNEL_CANDIDATES = ["XP募集", "xp募集", "xp-募集", "ｘｐ募集"]
-
-ZEN2HAN_TABLE = str.maketrans("０１２３４５６７８９．，－", "0123456789.,-")
-
-NUM_PATTERN = re.compile(r"(-?\d+(?:\.\d+)?)")
-
-def _normalize_num_text(text: str) -> str:
-    return text.translate(ZEN2HAN_TABLE).replace(",", "")
-
-async def _find_xp_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    lowers = [c.lower() for c in XP_CHANNEL_CANDIDATES]
-    for ch in guild.text_channels:
-        if ch.name.lower() in lowers:
-            return ch
-    return None
-
-async def _latest_number_for_user(
-    channel: discord.TextChannel, user_id: int, limit: int = 1000
-) -> str | None:
-    async for msg in channel.history(limit=limit, oldest_first=False):
-        if msg.author.id != user_id:
-            continue
-        m = NUM_PATTERN.search(_normalize_num_text(msg.content))
-        if m:
-            return m.group(1)
-    return None
-
-
 # ─────────────────────────────
-# /hlt set-intro  … 管理者用：自己紹介チャンネルを登録
+# /hlt set-intro（管理者）
 # ─────────────────────────────
 @hlt.command(name="set-intro", description="このサーバーの自己紹介チャンネルを登録します（管理者のみ）")
 @app_commands.describe(channel="自己紹介用のテキストチャンネル")
@@ -185,7 +149,7 @@ async def hlt_set_intro(interaction: discord.Interaction, channel: discord.TextC
     await interaction.followup.send(f"自己紹介チャンネルを {channel.mention} に設定しました。", ephemeral=True)
 
 # ─────────────────────────────
-# /hlt auto  … 自動検出（管理者向け）
+# /hlt auto（管理者）
 # ─────────────────────────────
 @hlt.command(name="auto", description="自己紹介チャンネルを自動検出して登録します（管理者のみ）")
 @app_commands.default_permissions(manage_guild=True)
@@ -214,13 +178,12 @@ async def hlt_auto(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # 一番ユーザー数が多い or 一番古い順など、ここでは一番上（役職順）の候補を採用
     chosen = sorted(candidates, key=lambda c: c.position)[0]
     await set_intro_channel(interaction.guild.id, chosen.id)
     await interaction.followup.send(f"自己紹介チャンネルを自動検出：{chosen.mention} に設定しました。", ephemeral=True)
 
 # ─────────────────────────────
-# /hlt config  … 現在の設定を確認
+# /hlt config
 # ─────────────────────────────
 @hlt.command(name="config", description="このサーバーの自己紹介チャンネル設定を表示します。")
 async def hlt_config(interaction: discord.Interaction):
@@ -237,9 +200,9 @@ async def hlt_config(interaction: discord.Interaction):
     await interaction.response.send_message(f"現在の自己紹介チャンネル：{mention}", ephemeral=True)
 
 # ─────────────────────────────
-# /hlt intro  … 指定ユーザーの自己紹介（最新投稿）を呼び出す
+# /hlt intro
 # ─────────────────────────────
-@hlt.command(name="intro", description="指定ユーザーの自己紹介（最新投稿）をこのチャンネルに呼び出します。")
+@hlt.command(name="intro", description="指定ユーザーの最新の自己紹介を呼び出します。")
 @app_commands.describe(user="自己紹介を取り出したいユーザー")
 async def hlt_intro(interaction: discord.Interaction, user: discord.User):
     if interaction.guild is None:
@@ -254,7 +217,6 @@ async def hlt_intro(interaction: discord.Interaction, user: discord.User):
 
     await interaction.response.defer(thinking=True)
 
-    # チャンネル取得
     intro_ch: Optional[discord.TextChannel] = interaction.client.get_channel(ch_id)
     if intro_ch is None:
         try:
@@ -267,25 +229,23 @@ async def hlt_intro(interaction: discord.Interaction, user: discord.User):
     if not isinstance(intro_ch, discord.TextChannel):
         return await interaction.followup.send("設定されたチャンネルがテキストチャンネルではありません。", ephemeral=True)
 
-    # 最新投稿を検索
     target_msg = await find_latest_intro_message(intro_ch, user.id, search_limit=800)
 
     if target_msg is None:
         return await interaction.followup.send(
-            f"{user.mention} の自己紹介投稿は見つかりませんでした（直近800件を確認）。",
-            allowed_mentions=discord.AllowedMentions.none(),
+            f"{user.mention} の自己紹介投稿は見つかりませんでした（直近800件）。",
+            allowed_mentions=ALLOWED_NONE,
             ephemeral=True
         )
 
     created = discord.utils.format_dt(target_msg.created_at, style='F')
     header = f"**{user.mention} の自己紹介（{created}）**\n"
-    body = target_msg.content if target_msg.content else "*（本文なし・Message Content Intentを有効にしていない可能性があります）*"
+    body = target_msg.content or "*（本文なし・Message Content Intentを有効にしていない可能性）*"
     footer = f"\n\n[元メッセージへ]({target_msg.jump_url})"
 
     files = []
     try:
         for a in target_msg.attachments[:5]:
-            # 8MB超はURLのみ（Renderの無料枠などを想定）
             if a.size and a.size > 8 * 1024 * 1024:
                 footer += f"\n添付（大容量）: {a.url}"
             else:
@@ -296,73 +256,68 @@ async def hlt_intro(interaction: discord.Interaction, user: discord.User):
     await interaction.followup.send(
         header + body + footer,
         files=files,
-        allowed_mentions=discord.AllowedMentions.none()
+        allowed_mentions=ALLOWED_NONE
     )
 
 # ─────────────────────────────
-# /hlt xp  … XP募集から数値取得（既存の hlt グループに統合）
+# /hlt set-xp（参照チャンネルを指定：シンプル版）
 # ─────────────────────────────
-@hlt.command(
-    name="xp",
-    description="『XP募集』チャンネルから指定ユーザーの最新数値を取得します。"
-)
-@app_commands.describe(user="対象ユーザー（サーバーメンバー）")
-async def hlt_xp(interaction: discord.Interaction, user: discord.Member):
-    import asyncio
+@hlt.command(name="set-xp", description="XP募集の参照チャンネルを設定します（管理者のみ）")
+@app_commands.describe(channel="XP募集のテキストチャンネル")
+@app_commands.default_permissions(manage_guild=True)
+@admin_only()
+async def hlt_set_xp(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    client.xp_channels[interaction.guild.id] = channel.id
+    await interaction.response.send_message(
+        f"XP参照チャンネルを {channel.mention} に設定しました。",
+        ephemeral=True
+    )
 
-    # ❶ 最初に必ず defer（以後は followup.send に統一）
+# ─────────────────────────────
+# /hlt xp <名前>（シンプル版：複数行から一致行を引用）
+# ─────────────────────────────
+@hlt.command(name="xp", description="設定チャンネルから『名前を含む行』を探して引用します。")
+@app_commands.describe(name="検索する名前（部分一致）")
+async def hlt_xp(interaction: discord.Interaction, name: str):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+
+    ch_id = client.xp_channels.get(interaction.guild.id)
+    if ch_id is None:
+        return await interaction.response.send_message(
+            "XP参照チャンネルが未設定です。まず `/hlt set-xp #チャンネル` を実行してください。",
+            ephemeral=True
+        )
+
+    channel = interaction.guild.get_channel(ch_id)
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.response.send_message("設定されたチャンネルが見つかりませんでした。", ephemeral=True)
+
     await interaction.response.defer(thinking=True)
 
-    guild = interaction.guild
-    if guild is None:
-        await interaction.followup.send("サーバー内で実行してください。", ephemeral=True)
-        return
+    target_lower = name.lower()
+    # 直近500件を後ろから前に検索（新しい→古い）
+    async for msg in channel.history(limit=500, oldest_first=False):
+        if not msg.content:
+            continue
+        for line in msg.content.splitlines():
+            if target_lower in line.lower():
+                await interaction.followup.send(f"引用: {line}", allowed_mentions=ALLOWED_NONE)
+                return
 
-    xp_ch = await _find_xp_channel(guild)
-    if xp_ch is None:
-        await interaction.followup.send("『XP募集』チャンネルが見つかりません。", ephemeral=True)
-        return
-
-    me = guild.me or guild.get_member(interaction.client.user.id)  # type: ignore
-    perms = xp_ch.permissions_for(me)
-    if not (perms.view_channel and perms.read_messages and perms.read_message_history):
-        await interaction.followup.send("『XP募集』の履歴を読めません（権限不足）。", ephemeral=True)
-        return
-
-    # ❷ 履歴スキャンにタイムアウトを付与（Unknown interactionの予防）
-    async def _scan():
-        return await _latest_number_for_user(xp_ch, user.id, limit=600)
-
-    try:
-        number = await asyncio.wait_for(_scan(), timeout=7)
-    except asyncio.TimeoutError:
-        await interaction.followup.send("検索に時間がかかりすぎました。後でもう一度お試しください。", ephemeral=True)
-        return
-    except Exception as e:
-        await interaction.followup.send(f"検索中にエラー: {e}", ephemeral=True)
-        return
-
-    # ❸ 出力（display_nameはメンションではないため通知されません）
-    if number is None:
-        await interaction.followup.send(f"{user.display_name} さんの記入が見つかりませんでした。")
-    else:
-        await interaction.followup.send(f"{user.display_name} さん: XP {number}")
+    await interaction.followup.send(f"'{name}' を含む行は見つかりませんでした。", allowed_mentions=ALLOWED_NONE)
 
 # ─────────────────────────────
 # ==== イベントランキング（ユーザー指定対応） ====
 #   /hlt eventrank [@ユーザー]
-#   ユーザー未指定: ランキング（10位/ページ、◀️▶️⏹️）
-#   ユーザー指定  : その人の件数を数値で表示
 # ─────────────────────────────
-
 EMOJI_PREV = "◀️"
 EMOJI_NEXT = "▶️"
 EMOJI_STOP = "⏹️"
 
 async def _build_event_interest_ranking_for_guild(guild: discord.Guild) -> list[tuple[int, int]]:
-    """
-    戻り値: [(user_id, count), ...] を count降順・同率は user_id 昇順でソート
-    """
     counts = collections.Counter()
     try:
         events = await guild.fetch_scheduled_events()
@@ -371,7 +326,6 @@ async def _build_event_interest_ranking_for_guild(guild: discord.Guild) -> list[
 
     for ev in events:
         try:
-            # イベントの「興味あり（購読者）」を列挙
             async for u in ev.fetch_users(limit=None, with_members=False):
                 counts[u.id] += 1
         except discord.Forbidden:
@@ -400,7 +354,6 @@ def _build_eventrank_pages(guild: discord.Guild, ranking: list[tuple[int, int]],
         )
         lines = []
         for idx, (uid, cnt) in enumerate(chunk, start=start + 1):
-            # メンション抑止のため allowed_mentions=ALLOWED_NONE を送信側で使用
             lines.append(f"{idx}. <@{uid}> — **{cnt} 件**")
         footer = f"\nページ {i+1}/{total_pages}｜対象メンバー数: {total}"
         pages.append(header + "\n".join(lines) + footer)
@@ -412,7 +365,6 @@ def _build_eventrank_pages(guild: discord.Guild, ranking: list[tuple[int, int]],
 )
 @app_commands.describe(user="対象ユーザー（指定すると件数のみ表示）")
 async def hlt_eventrank(interaction: discord.Interaction, user: discord.Member | None = None):
-    # ランキングはページ送り（リアクション操作）するので公開メッセージで返す（ephemeral不可）
     await interaction.response.defer(thinking=True)
 
     guild = interaction.guild
@@ -420,7 +372,6 @@ async def hlt_eventrank(interaction: discord.Interaction, user: discord.Member |
         await interaction.followup.send("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
         return
 
-    # 権限チェック（閲覧・メッセージ・リアクション）
     me = guild.me or guild.get_member(interaction.client.user.id)  # type: ignore
     if me is None:
         await interaction.followup.send("内部エラー：Botメンバーを確認できませんでした。", ephemeral=True)
@@ -434,10 +385,8 @@ async def hlt_eventrank(interaction: discord.Interaction, user: discord.Member |
         await interaction.followup.send("権限不足：Send Messages / Read Message History / View Channel が必要です。", ephemeral=True)
         return
 
-    # ランキングデータ作成（共通）
     ranking = await _build_event_interest_ranking_for_guild(guild)
 
-    # --- ユーザー指定あり：件数のみ数値で表示 ---
     if user is not None:
         count = next((c for uid, c in ranking if uid == user.id), 0)
         await interaction.followup.send(
@@ -446,7 +395,6 @@ async def hlt_eventrank(interaction: discord.Interaction, user: discord.Member |
         )
         return
 
-    # --- ユーザー未指定：従来のランキング（10位/ページ、リアクションでページ送り） ---
     pages = _build_eventrank_pages(guild, ranking, page_size=10)
     page_index = 0
 
@@ -482,7 +430,6 @@ async def hlt_eventrank(interaction: discord.Interaction, user: discord.Member |
                 break
 
             emoji = str(payload.emoji)
-            # 押した人のリアクションは毎回外す（視認性）
             try:
                 await msg.remove_reaction(emoji, discord.Object(id=payload.user_id))
             except discord.Forbidden:
@@ -512,11 +459,12 @@ async def hlt_help(interaction: discord.Interaction):
         "`/hlt auto` …（管理者）自己紹介チャンネルを自動検出して登録\n"
         "`/hlt config` … 現在の設定を表示\n"
         "`/hlt intro @ユーザー` … 登録チャンネルから、指定ユーザーの最新自己紹介を呼び出す\n\n"
-        "`/hlt xp @ユーザー` … 『XP募集』からそのユーザーの最新の数値を取得\n"
+        "`/hlt set-xp #チャンネル` …（管理者）XP参照チャンネルを登録（シンプル版）\n"
+        "`/hlt xp 名前` … 参照チャンネルから『名前を含む行』を検索して引用\n\n"
         "`/hlt eventrank` … このサーバーのイベントで『興味あり』回数のランキング（10位/ページ、リアクションで操作）\n"
         "`/hlt eventrank @ユーザー` … 指定ユーザーが『興味あり』を押した回数（数値のみ）を表示\n\n"
-        "※ Botには「View Channel」「Read Message History」「Send Messages」「Embed Links」「Attach Files」「Add Reactions（推奨）」「Manage Messages（任意）」の権限が必要です。\n"
-        "※ メッセージ本文を取得するには Developer Portal で **MESSAGE CONTENT INTENT** をONにしてください。"
+        "※ Botには「View Channel」「Read Message History」「Send Messages」「Embed Links」「Attach Files」「Add Reactions（推奨）」の権限が必要です。\n"
+        "※ /hlt xp は Developer Portal の **MESSAGE CONTENT INTENT** をONにしておく必要があります。"
     )
     await interaction.response.send_message(text, ephemeral=True)
 
@@ -525,12 +473,10 @@ async def hlt_help(interaction: discord.Interaction):
 # ─────────────────────────────
 @client.event
 async def on_ready():
-    # setup_hook() で sync 済みなのでログだけでOK
     log.info("Logged in as %s (ID: %s)", client.user, client.user.id)
 
 @client.event
 async def on_guild_join(guild: discord.Guild):
-    # 参加直後に自己紹介チャンネルを軽く推測（未設定なら）
     try:
         existing = await get_intro_channel_id(guild.id)
         if existing:
