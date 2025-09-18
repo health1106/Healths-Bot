@@ -6,6 +6,12 @@ import re
 import math
 import collections
 import discord
+
+# メンション通知を完全に抑止（ユーザー/ロール/@everyone、返信通知もオフ）
+ALLOWED_NONE = discord.AllowedMentions(
+    everyone=False, roles=False, users=False, replied_user=False
+)
+
 from discord import app_commands
 import asyncpg
 
