@@ -8,6 +8,12 @@ import discord
 from discord import app_commands
 import asyncpg
 
+# 追加: スケジュール取得・時刻/並列・HTTP
+import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import aiohttp
+
 # ─────────────────────────────
 # 環境変数
 # ─────────────────────────────
@@ -39,6 +45,168 @@ intents.guild_scheduled_events = True   # eventrank に必要
 ALLOWED_NONE = discord.AllowedMentions(
     everyone=False, roles=False, users=False, replied_user=False
 )
+
+# ─────────────────────────────
+# ここから 追加: スプラ3 スケジュール機能 共通
+# ─────────────────────────────
+JST = ZoneInfo("Asia/Tokyo")
+S3_SCHEDULES_URL = "https://splatoon3.ink/data/schedules.json"
+UA = "YadoBot-S3/1.0 (+github.com/yourname)"
+
+async def fetch_json(url: str) -> dict:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": UA}) as session:
+        async with session.get(url) as r:
+            r.raise_for_status()
+            return await r.json()
+
+def fmt_dt_any(iso_or_none) -> str:
+    if not iso_or_none:
+        return "?"
+    try:
+        s = str(iso_or_none).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        return dt.astimezone(JST).strftime("%m/%d %H:%M")
+    except Exception:
+        return "?"
+
+def safe_get(d, *keys, default=None):
+    cur = d
+    for k in keys:
+        if isinstance(cur, dict):
+            cur = cur.get(k)
+        elif isinstance(cur, list) and isinstance(k, int) and 0 <= k < len(cur):
+            cur = cur[k]
+        else:
+            return default
+    return cur if cur is not None else default
+
+# Embedを複数返す（説明Embed + 画像Embed（最大2枚）をモードごとに生成）
+def build_schedule_embeds_multi(data: dict) -> List[discord.Embed]:
+    sections = [
+        ("🏷 ナワバリ",            ["regular", None]),
+        ("🏷 バンカラ(オープン)",  ["ranked",  "open"]),
+        ("🏷 バンカラ(チャレンジ)",["ranked",  "series"]),
+        ("🏷 Xマッチ",            ["xbattle", None]),
+    ]
+
+    embeds: List[discord.Embed] = []
+    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+
+    for title, path in sections:
+        # data構造のばらつきに対応
+        cur_list = data.get("regular") if path[0] == "regular" else data.get(path[0])
+        if not isinstance(cur_list, list) or not cur_list:
+            continue
+
+        # 現在枠のみを主表示（必要なら次枠も拡張可能）
+        node = cur_list[0]
+        if path[1] is not None:
+            node = safe_get(node, path[1], default=None)
+            if not node:
+                continue
+
+        s1 = safe_get(node, "vsStages", 0, "name") or safe_get(node, "stage1", "name") or "?"
+        s2 = safe_get(node, "vsStages", 1, "name") or safe_get(node, "stage2", "name") or "?"
+        rule = safe_get(node, "vsRule", "name") or node.get("rules") or node.get("rule") or "?"
+        st   = node.get("start_time") or node.get("startTime")
+        en   = node.get("end_time")   or node.get("endTime")
+
+        desc = f"{fmt_dt_any(st)}–{fmt_dt_any(en)}｜{rule}\n{s1} / {s2}\n（{now} 現在）"
+        info = discord.Embed(title=title, description=desc, color=0x00AEEF)
+        embeds.append(info)
+
+        # 画像Embed 2枚まで
+        img1 = safe_get(node, "vsStages", 0, "image", "url") or safe_get(node, "stage1", "image", "url")
+        img2 = safe_get(node, "vsStages", 1, "image", "url") or safe_get(node, "stage2", "image", "url")
+        if img1:
+            embeds.append(discord.Embed(color=0x00AEEF).set_image(url=img1))
+        if img2:
+            embeds.append(discord.Embed(color=0x00AEEF).set_image(url=img2))
+
+    # 1メッセージに添付できるEmbedは最大10個。ここでは全体で返すだけ。
+    return embeds
+
+def build_salmon_embeds_multi(data: dict) -> List[discord.Embed]:
+    # schedules.jsonのcoop系に柔軟対応
+    coop = data.get("coop") or data
+    # よくあるキー候補
+    streams = [
+        ("🧰 サーモンラン（通常）",      ["regularSchedules"]),
+        ("🌊 ビッグラン",               ["bigRunSchedules"]),
+        ("🎪 期間限定イベントマッチ",     ["limitedSchedules", "eventSchedules"]),
+    ]
+
+    embeds: List[discord.Embed] = []
+    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+
+    for label, path in streams:
+        node = coop
+        for k in path:
+            node = safe_get(node, k, default=None)
+            if node is None:
+                break
+        if node is None:
+            continue
+
+        # list or dict → list化
+        scheds = list(node.values()) if isinstance(node, dict) else list(node)
+        if not scheds:
+            continue
+
+        # 現在と次の2枠まで
+        for n in scheds[:2]:
+            st = n.get("start_time") or n.get("startTime")
+            en = n.get("end_time")   or n.get("endTime")
+            stage = safe_get(n, "stage", "name") or "?"
+            # weapon名（あれば）
+            weps = n.get("weapons")
+            wnames = []
+            if isinstance(weps, dict):
+                wnames = [safe_get(w, "name") for w in weps.values()]
+            elif isinstance(weps, list):
+                wnames = [safe_get(w, "name") for w in weps]
+            wnames = [w for w in wnames if w]
+
+            desc = f"{fmt_dt_any(st)}–{fmt_dt_any(en)}｜{stage}\n" + (" / ".join(wnames) if wnames else "（支給ブキ情報なし）") + f"\n（{now} 現在）"
+            info = discord.Embed(title=label, description=desc, color=0xF49A1A)
+            embeds.append(info)
+
+            img = safe_get(n, "stage", "image", "url")
+            if img:
+                embeds.append(discord.Embed(color=0xF49A1A).set_image(url=img))
+
+    return embeds
+
+async def send_embeds_with_autodelete(interaction: discord.Interaction, embeds: List[discord.Embed], delete_after_sec: int = 60):
+    """
+    Embedを10個ずつに分割して複数メッセージ送信。delete_after_sec 後に全削除。
+    """
+    MAX_PER_MESSAGE = 10
+    chunks = [embeds[i:i+MAX_PER_MESSAGE] for i in range(0, len(embeds), MAX_PER_MESSAGE)] or [[]]
+
+    sent_msgs: List[discord.Message] = []
+    for i, chunk in enumerate(chunks):
+        # chunkが空なら案内だけ
+        if not chunk:
+            m = await interaction.followup.send("表示できるスケジュールがありませんでした。")
+            sent_msgs.append(m)
+        else:
+            m = await interaction.followup.send(embeds=chunk)
+            sent_msgs.append(m)
+
+    # 自動削除
+    await asyncio.sleep(delete_after_sec)
+    for m in sent_msgs:
+        try:
+            await m.delete()
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            # 権限がない場合はスキップ
+            pass
 
 # ─────────────────────────────
 # Botクラス
@@ -449,6 +617,43 @@ async def hlt_eventrank(interaction: discord.Interaction, user: discord.Member |
                 await msg.edit(content=pages[page_index], allowed_mentions=ALLOWED_NONE)
 
 # ─────────────────────────────
+# 追加: /hlt s3 （スプラ3スケジュール）
+# ─────────────────────────────
+@hlt.command(name="s3", description="Splatoon 3 の現在スケジュールを表示（画像を複数Embedで並べます／60秒で自動削除）")
+@app_commands.describe(kind="schedule=対戦 / salmon=サーモンラン")
+@app_commands.choices(kind=[
+    app_commands.Choice(name="schedule（対戦）", value="schedule"),
+    app_commands.Choice(name="salmon（サーモン）", value="salmon"),
+])
+async def hlt_s3(interaction: discord.Interaction, kind: app_commands.Choice[str]):
+    await interaction.response.defer(thinking=True)
+
+    # 権限チェック（Embed Linksが無いと画像が出ません）
+    if interaction.channel and isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        me = interaction.guild.me if interaction.guild else None
+        if me:
+            perms = interaction.channel.permissions_for(me)  # type: ignore
+            if not (perms.send_messages and perms.embed_links):
+                return await interaction.followup.send("権限不足：このチャンネルで Embed Links を許可してください。", ephemeral=True)
+
+    try:
+        data = await fetch_json(S3_SCHEDULES_URL)
+    except Exception as e:
+        log.warning("S3 schedules fetch failed: %s", e)
+        return await interaction.followup.send("スケジュール取得に失敗しました。時間をおいて再試行してください。", ephemeral=True)
+
+    if kind.value == "salmon":
+        embeds = build_salmon_embeds_multi(data)
+        # SalmonはEmbed数が少なめのことが多い
+    else:
+        embeds = build_schedule_embeds_multi(data)
+
+    if not embeds:
+        return await interaction.followup.send("表示できるスケジュールが見つかりませんでした。", ephemeral=True)
+
+    await send_embeds_with_autodelete(interaction, embeds, delete_after_sec=60)
+
+# ─────────────────────────────
 # /hlt help
 # ─────────────────────────────
 @hlt.command(name="help", description="コマンドの使い方を表示します。")
@@ -463,6 +668,7 @@ async def hlt_help(interaction: discord.Interaction):
         "`/hlt xp 名前` … 参照チャンネルから『名前を含む行』を検索して引用\n\n"
         "`/hlt eventrank` … このサーバーのイベントで『興味あり』回数のランキング（10位/ページ、リアクションで操作）\n"
         "`/hlt eventrank @ユーザー` … 指定ユーザーが『興味あり』を押した回数（数値のみ）を表示\n\n"
+        "`/hlt s3 kind:(schedule|salmon)` … スプラ3スケジュールを表示（画像を複数Embedで並べる／60秒後に自動削除）\n"
         "※ Botには「View Channel」「Read Message History」「Send Messages」「Embed Links」「Attach Files」「Add Reactions（推奨）」の権限が必要です。\n"
         "※ /hlt xp は Developer Portal の **MESSAGE CONTENT INTENT** をONにしておく必要があります。"
     )
