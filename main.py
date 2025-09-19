@@ -1,8 +1,8 @@
-# yado_bot_complete.py
 import os
 import io
 import logging
-from typing import Optional, List
+from typing import Optional, List, Tuple
+
 import math
 import collections
 import asyncio
@@ -99,6 +99,7 @@ def safe_get(d, *keys, default=None):
             return default
     return cur if cur is not None else default
 
+# ルール名フォールバック
 _RULE_EN2JA = {
     "Turf War": "ナワバリバトル",
     "Splat Zones": "ガチエリア",
@@ -203,7 +204,7 @@ class YadoBot(discord.Client):
 client = YadoBot()
 
 # ─────────────────────────────
-# /hlt グループ
+# /hlt グループ定義
 # ─────────────────────────────
 hlt = app_commands.Group(name="hlt", description="ヘルパーコマンド集")
 client.tree.add_command(hlt)
@@ -367,6 +368,8 @@ async def hlt_s3(interaction: discord.Interaction):
 
     first_embed, first_file = pages[0]
     await interaction.followup.send(embed=first_embed, file=first_file)
+
+
 
 
 def main():
