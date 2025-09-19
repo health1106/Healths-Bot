@@ -4,15 +4,17 @@ from typing import Optional, List
 
 import math
 import collections
+import asyncio
 import discord
 from discord import app_commands
 import asyncpg
+import yt_dlp
 
 # ─────────────────────────────
 # 環境変数
 # ─────────────────────────────
 TOKEN = os.getenv("DISCORD_TOKEN")         # Discord Botトークン
-DATABASE_URL = os.getenv("DATABASE_URL")   # RenderのPostgreSQL接続文字列
+DATABASE_URL = os.getenv("DATABASE_URL")   # PostgreSQL接続文字列（自己紹介設定用）
 
 # ─────────────────────────────
 # ロギング
@@ -32,6 +34,7 @@ intents.members = True
 intents.messages = True
 intents.message_content = True          # /hlt xp で本文検索に必要
 intents.guild_scheduled_events = True   # eventrank に必要
+intents.voice_states = True             # 音楽でVC状態を扱うなら有効が安心
 
 # ─────────────────────────────
 # メンション抑止（@通知を飛ばさない）
@@ -48,13 +51,13 @@ class YadoBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.pool: Optional[asyncpg.Pool] = None
-        # ── 追加：ギルドごとの XP 参照チャンネル（メモリ保持のシンプル実装）
+        # ギルドごとの XP 参照チャンネル（シンプル：メモリ保持）
         self.xp_channels: dict[int, int] = {}
 
     async def setup_hook(self):
         # DB接続とテーブル作成（自己紹介設定用）
         if not DATABASE_URL:
-            log.warning("DATABASE_URL が未設定です。DBを使うコマンドは失敗します。")
+            log.warning("DATABASE_URL が未設定です。自己紹介系の一部コマンドは失敗します。")
         else:
             self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
             async with self.pool.acquire() as conn:
@@ -65,7 +68,7 @@ class YadoBot(discord.Client):
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                 """)
-        # グローバルコマンドを同期
+        # スラッシュコマンド同期
         await self.tree.sync()
 
 client = YadoBot()
@@ -298,7 +301,7 @@ async def hlt_xp(interaction: discord.Interaction, name: str):
     await interaction.response.defer(thinking=True)
 
     target_lower = name.lower()
-    # 直近500件を後ろから前に検索（新しい→古い）
+    # 直近500件を新しい順に検索
     async for msg in channel.history(limit=500, oldest_first=False):
         if not msg.content:
             continue
@@ -449,22 +452,186 @@ async def hlt_eventrank(interaction: discord.Interaction, user: discord.Member |
                 await msg.edit(content=pages[page_index], allowed_mentions=ALLOWED_NONE)
 
 # ─────────────────────────────
+# 音楽再生：/hlt m … サブグループ
+#   依存: pip install -U "discord.py[voice]" yt-dlp
+#   FFmpeg がシステムにインストールされていること
+# ─────────────────────────────
+YDL_OPTS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "nocheckcertificate": True,
+    "noplaylist": True,
+    "default_search": "ytsearch",
+}
+FFMPEG_OPTS = {
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn",
+}
+
+class GuildPlayer:
+    def __init__(self, guild: discord.Guild):
+        self.guild = guild
+        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        self.play_task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+
+    def is_connected(self) -> bool:
+        return self.guild.voice_client is not None and self.guild.voice_client.is_connected()
+
+    async def ensure_joined(self, interaction: discord.Interaction):
+        vc = self.guild.voice_client
+        if vc and vc.is_connected():
+            return vc
+        # 呼び出しユーザーのいるVCへ接続
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.voice or not interaction.user.voice.channel:
+            raise RuntimeError("先にボイスチャンネルに参加してください。")
+        return await interaction.user.voice.channel.connect()
+
+    async def enqueue(self, url: str):
+        await self.queue.put(url)
+
+    async def stop(self):
+        self._stop.set()
+        vc = self.guild.voice_client
+        if vc and vc.is_playing():
+            vc.stop()
+        # キュー消去
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except Exception:
+                break
+        self._stop.clear()
+
+    async def player_loop(self, interaction: discord.Interaction):
+        try:
+            vc = await self.ensure_joined(interaction)
+        except Exception as e:
+            await interaction.followup.send(f"参加できませんでした：{e}", ephemeral=True)
+            return
+
+        ydl = yt_dlp.YoutubeDL(YDL_OPTS)
+        while not self._stop.is_set():
+            try:
+                url = await asyncio.wait_for(self.queue.get(), timeout=300)  # 5分無音で終了
+            except asyncio.TimeoutError:
+                break
+            try:
+                info = ydl.extract_info(url, download=False)
+                if "entries" in info:  # 検索語の場合
+                    info = info["entries"][0]
+                stream_url = info["url"]
+                title = info.get("title", url)
+                source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTS)
+                vc.play(source)
+                await interaction.followup.send(f"▶️ 再生開始：{title}")
+                # 再生完了を待機
+                while vc.is_playing():
+                    await asyncio.sleep(0.5)
+            except Exception as e:
+                await interaction.followup.send(f"再生エラー：{e}")
+                continue
+
+# ギルド別プレイヤー保持
+players: dict[int, GuildPlayer] = {}
+def get_player(guild: discord.Guild) -> GuildPlayer:
+    if guild.id not in players:
+        players[guild.id] = GuildPlayer(guild)
+    return players[guild.id]
+
+# /hlt の下に m サブグループ
+music = app_commands.Group(name="m", description="音楽コマンド")
+hlt.add_command(music)
+
+@music.command(name="join", description="あなたのボイスチャンネルに参加します。")
+async def m_join(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    player = get_player(interaction.guild)
+    try:
+        await player.ensure_joined(interaction)
+        await interaction.followup.send("✅ 参加しました。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"参加できませんでした：{e}", ephemeral=True)
+
+@music.command(name="play", description="YouTubeのURL（または検索語）を再生キューに追加します。")
+@app_commands.describe(url="YouTube URL または 検索語（短め推奨）")
+async def m_play(interaction: discord.Interaction, url: str):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    await interaction.response.defer(thinking=True)
+    player = get_player(interaction.guild)
+    try:
+        await player.ensure_joined(interaction)
+    except Exception as e:
+        return await interaction.followup.send(f"参加できませんでした：{e}", ephemeral=True)
+
+    await player.enqueue(url)
+    await interaction.followup.send("➕ キューに追加しました。")
+    if not player.play_task or player.play_task.done():
+        player.play_task = asyncio.create_task(player.player_loop(interaction))
+
+@music.command(name="skip", description="現在の曲をスキップします。")
+async def m_skip(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        return await interaction.response.send_message("ボイスチャンネルに未接続です。", ephemeral=True)
+    if vc.is_playing():
+        vc.stop()
+        await interaction.response.send_message("⏭️ スキップしました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("現在再生していません。", ephemeral=True)
+
+@music.command(name="stop", description="再生を停止し、キューをクリアします。")
+async def m_stop(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    player = get_player(interaction.guild)
+    await player.stop()
+    await interaction.followup.send("⏹️ 停止しました（キュー消去）。", ephemeral=True)
+
+@music.command(name="leave", description="ボイスチャンネルから退出します。")
+async def m_leave(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    vc = interaction.guild.voice_client
+    if vc and vc.is_connected():
+        await vc.disconnect()
+        await interaction.response.send_message("👋 退出しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("ボイスチャンネルに未接続です。", ephemeral=True)
+
+# ─────────────────────────────
 # /hlt help
 # ─────────────────────────────
 @hlt.command(name="help", description="コマンドの使い方を表示します。")
 async def hlt_help(interaction: discord.Interaction):
     text = (
         "**Yado Bot - ヘルプ**\n"
-        "`/hlt set-intro #チャンネル` …（管理者）自己紹介チャンネルを登録\n"
-        "`/hlt auto` …（管理者）自己紹介チャンネルを自動検出して登録\n"
-        "`/hlt config` … 現在の設定を表示\n"
-        "`/hlt intro @ユーザー` … 登録チャンネルから、指定ユーザーの最新自己紹介を呼び出す\n\n"
-        "`/hlt set-xp #チャンネル` …（管理者）XP参照チャンネルを登録（シンプル版）\n"
-        "`/hlt xp 名前` … 参照チャンネルから『名前を含む行』を検索して引用\n\n"
-        "`/hlt eventrank` … このサーバーのイベントで『興味あり』回数のランキング（10位/ページ、リアクションで操作）\n"
-        "`/hlt eventrank @ユーザー` … 指定ユーザーが『興味あり』を押した回数（数値のみ）を表示\n\n"
-        "※ Botには「View Channel」「Read Message History」「Send Messages」「Embed Links」「Attach Files」「Add Reactions（推奨）」の権限が必要です。\n"
-        "※ /hlt xp は Developer Portal の **MESSAGE CONTENT INTENT** をONにしておく必要があります。"
+        "【自己紹介】\n"
+        "• `/hlt set-intro #ch`（管理）… 自己紹介チャンネルを登録\n"
+        "• `/hlt auto`（管理）… 自動検出して登録\n"
+        "• `/hlt config` … 現在の設定を表示\n"
+        "• `/hlt intro @user` … 指定ユーザーの最新自己紹介を呼び出し\n\n"
+        "【XPシンプル検索】\n"
+        "• `/hlt set-xp #ch`（管理）… XP参照チャンネルを登録\n"
+        "• `/hlt xp 名前` … 参照チャンネルから『名前を含む行』を引用\n\n"
+        "【イベント】\n"
+        "• `/hlt eventrank` … 『興味あり』回数ランキング（10位/ページ）\n"
+        "• `/hlt eventrank @user` … 指定ユーザーの『興味あり』件数を表示\n\n"
+        "【音楽 /hlt m ...】\n"
+        "• `/hlt m join` … あなたのVCに参加\n"
+        "• `/hlt m play <url or words>` … YouTubeから再生（キュー追加）\n"
+        "• `/hlt m skip` … 次の曲へ\n"
+        "• `/hlt m stop` … 停止＆キュー消去\n"
+        "• `/hlt m leave` … VCから退出\n\n"
+        "※ 権限: View Channel / Send Messages / Read Message History / Add Reactions（ランキング） / Connect・Speak（音声）など。\n"
+        "※ 音楽機能は `pip install -U \"discord.py[voice]\" yt-dlp` と FFmpeg が必要です。\n"
+        "※ メッセージ本文を扱う機能は Developer Portal の **MESSAGE CONTENT INTENT** を ON にしてください。"
     )
     await interaction.response.send_message(text, ephemeral=True)
 
@@ -477,9 +644,9 @@ async def on_ready():
 
 @client.event
 async def on_guild_join(guild: discord.Guild):
+    # 参加直後に自己紹介チャンネルを軽く推測（未設定なら）
     try:
-        existing = await get_intro_channel_id(guild.id)
-        if existing:
+        if await get_intro_channel_id(guild.id):
             return
         candidates = [ch for ch in guild.text_channels if looks_like_intro_name(ch.name)]
         if candidates:
