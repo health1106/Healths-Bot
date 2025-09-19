@@ -1,9 +1,9 @@
+# yado_bot.py
 import os
 import io
 import logging
 from typing import Optional, List, Tuple
 
-import math
 import collections
 import asyncio
 from datetime import datetime
@@ -157,21 +157,27 @@ async def compose_side_by_side(url1: str, url2: str, total_width: int = 1000, ga
         )
     im1, im2 = Image.open(io.BytesIO(b1)).convert("RGBA"), Image.open(io.BytesIO(b2)).convert("RGBA")
     target_each_w = (total_width - gap) // 2
+
     def resize_to_width(img: Image.Image, w: int) -> Image.Image:
         scale = w / img.width
         h = max(1, int(round(img.height * scale)))
         return img.resize((w, h), Image.LANCZOS)
+
     im1r = resize_to_width(im1, target_each_w)
     im2r = resize_to_width(im2, target_each_w)
     h = min(im1r.height, im2r.height)
+
     def crop_center_h(img: Image.Image, h_target: int) -> Image.Image:
         top = max(0, (img.height - h_target) // 2)
         return img.crop((0, top, img.width, top + h_target))
+
     im1c = crop_center_h(im1r, h)
     im2c = crop_center_h(im2r, h)
+
     canvas = Image.new("RGBA", (target_each_w * 2 + gap, h), (0, 0, 0, 0))
     canvas.paste(im1c, (0, 0))
     canvas.paste(im2c, (target_each_w + gap, 0))
+
     out = io.BytesIO()
     canvas.convert("RGB").save(out, format="PNG", optimize=True)
     out.seek(0)
@@ -188,18 +194,29 @@ class YadoBot(discord.Client):
         self.xp_channels: dict[int, int] = {}
 
     async def setup_hook(self):
+        # DBはオプション
         if DATABASE_URL:
-            self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-            async with self.pool.acquire() as conn:
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS guild_settings (
-                        guild_id BIGINT PRIMARY KEY,
-                        intro_channel_id BIGINT NOT NULL,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                """)
+            try:
+                self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+                async with self.pool.acquire() as conn:
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS guild_settings (
+                            guild_id BIGINT PRIMARY KEY,
+                            intro_channel_id BIGINT NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """)
+            except Exception:
+                log.exception("PostgreSQL初期化に失敗しました（DBなしでも動作を継続します）")
+                self.pool = None
+
         await load_stage_locale()
-        await self.tree.sync()
+        # グローバル同期（開発中は guild 指定に切り替えてOK）
+        try:
+            await self.tree.sync()
+            log.info("App commands synced")
+        except Exception:
+            log.exception("App commands sync failed")
 
 client = YadoBot()
 
@@ -208,6 +225,22 @@ client = YadoBot()
 # ─────────────────────────────
 hlt = app_commands.Group(name="hlt", description="ヘルパーコマンド集")
 client.tree.add_command(hlt)
+
+# かんたんヘルプ
+@hlt.command(name="help", description="コマンド一覧を表示")
+async def hlt_help(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "**/hlt help** … このヘルプ\n"
+        "**/hlt set-intro <#ch>** … 自己紹介チャンネル設定（管理者）\n"
+        "**/hlt auto** … 自己紹介チャンネル自動検出（管理者）\n"
+        "**/hlt config** … 自己紹介設定表示\n"
+        "**/hlt intro <@user>** … 最新の自己紹介を引用\n"
+        "**/hlt set-xp <#ch>** … XP参照チャンネル設定（管理者）\n"
+        "**/hlt xp <名前>** … XP参照チャンネルから行を引用\n"
+        "**/hlt eventrank** … イベント『興味あり』ランキング\n"
+        "**/hlt s3** … Splatoon3スケジュール（2枚横並び画像）\n",
+        ephemeral=True
+    )
 
 # ─────────────────────────────
 # 自己紹介関連
@@ -247,7 +280,7 @@ async def find_latest_intro_message(channel: discord.TextChannel, user_id: int, 
 @admin_only()
 async def hlt_set_intro(interaction: discord.Interaction, channel: discord.TextChannel):
     if not client.pool:
-        return await interaction.response.send_message("DB未設定", ephemeral=True)
+        return await interaction.response.send_message("DB未設定です。DATABASE_URL を設定してください。", ephemeral=True)
     await set_intro_channel(interaction.guild.id, channel.id)
     await interaction.response.send_message(f"自己紹介チャンネルを {channel.mention} に設定しました。", ephemeral=True)
 
@@ -255,7 +288,7 @@ async def hlt_set_intro(interaction: discord.Interaction, channel: discord.TextC
 @admin_only()
 async def hlt_auto(interaction: discord.Interaction):
     if not client.pool:
-        return await interaction.response.send_message("DB未設定", ephemeral=True)
+        return await interaction.response.send_message("DB未設定です。DATABASE_URL を設定してください。", ephemeral=True)
     candidates = [ch for ch in interaction.guild.text_channels if looks_like_intro_name(ch.name)]
     if not candidates:
         return await interaction.response.send_message("見つかりませんでした。", ephemeral=True)
@@ -269,6 +302,8 @@ async def hlt_config(interaction: discord.Interaction):
     if not ch_id:
         return await interaction.response.send_message("未設定です。", ephemeral=True)
     channel = interaction.guild.get_channel(ch_id)
+    if channel is None:
+        return await interaction.response.send_message("保存されているチャンネルが見つかりません。再設定してください。", ephemeral=True)
     await interaction.response.send_message(f"現在の自己紹介チャンネル：{channel.mention}", ephemeral=True)
 
 @hlt.command(name="intro", description="指定ユーザーの最新自己紹介を表示")
@@ -277,6 +312,8 @@ async def hlt_intro(interaction: discord.Interaction, user: discord.User):
     if not ch_id:
         return await interaction.response.send_message("未設定です。", ephemeral=True)
     intro_ch: Optional[discord.TextChannel] = interaction.guild.get_channel(ch_id)
+    if intro_ch is None:
+        return await interaction.response.send_message("自己紹介チャンネルが見つかりません。再設定してください。", ephemeral=True)
     msg = await find_latest_intro_message(intro_ch, user.id)
     if not msg:
         return await interaction.response.send_message("見つかりませんでした。", ephemeral=True)
@@ -297,11 +334,16 @@ async def hlt_xp(interaction: discord.Interaction, name: str):
     if not ch_id:
         return await interaction.response.send_message("XP参照チャンネルが未設定です。", ephemeral=True)
     channel = interaction.guild.get_channel(ch_id)
+    if channel is None:
+        return await interaction.response.send_message("XP参照チャンネルが見つかりません。再設定してください。", ephemeral=True)
+
+    # 長くなる可能性があるので defer
+    await interaction.response.defer(ephemeral=True)
     async for msg in channel.history(limit=500):
         for line in msg.content.splitlines():
             if name.lower() in line.lower():
-                return await interaction.response.send_message(f"引用: {line}", allowed_mentions=ALLOWED_NONE)
-    await interaction.response.send_message("見つかりませんでした。", ephemeral=True)
+                return await interaction.followup.send(f"引用: {line}", allowed_mentions=ALLOWED_NONE)
+    await interaction.followup.send("見つかりませんでした。", ephemeral=True)
 
 # ─────────────────────────────
 # イベントランキング
@@ -328,54 +370,73 @@ def _build_eventrank_pages(guild: discord.Guild, ranking: list[tuple[int, int]],
 
 @hlt.command(name="eventrank", description="イベント『興味あり』ランキング")
 async def hlt_eventrank(interaction: discord.Interaction):
-    ranking = await _build_event_interest_ranking_for_guild(interaction.guild)
-    pages = _build_eventrank_pages(interaction.guild, ranking)
-    page = 0
-    msg = await interaction.response.send_message(pages[page])
-    # ここにリアクションでのページ送り処理を追加してもOK
+    try:
+        await interaction.response.defer(ephemeral=True)
+        ranking = await _build_event_interest_ranking_for_guild(interaction.guild)
+        pages = _build_eventrank_pages(interaction.guild, ranking)
+        await interaction.followup.send(pages[0], allowed_mentions=ALLOWED_NONE)
+    except Exception:
+        log.exception("/hlt eventrank でエラー")
+        await interaction.followup.send("取得中にエラーが発生しました。後でもう一度お試しください。", ephemeral=True)
 
 # ─────────────────────────────
 # スプラ3スケジュール表示
 # ─────────────────────────────
 @hlt.command(name="s3", description="Splatoon3の最新スケジュールを表示")
 async def hlt_s3(interaction: discord.Interaction):
-    await interaction.response.defer()
-    data = await fetch_json(S3_SCHEDULES_URL)
+    try:
+        await interaction.response.defer()
+        data = await fetch_json(S3_SCHEDULES_URL)
 
-    bankara = safe_get(data, "data", "bankaraSchedules", "nodes", default=[])
-    if not bankara:
-        return await interaction.followup.send("スケジュール取得に失敗しました。")
+        bankara_nodes = safe_get(data, "data", "bankaraSchedules", "nodes", default=[])
+        if not bankara_nodes:
+            return await interaction.followup.send("スケジュール取得に失敗しました。")
 
-    pages = []
-    for node in bankara[:3]:
-        setting = safe_get(node, "regularMatchSetting") or {}
-        s1 = stage_name_ja(safe_get(setting, "vsStages", 0) or {})
-        s2 = stage_name_ja(safe_get(setting, "vsStages", 1) or {})
-        rule = to_ja_rule(safe_get(setting, "vsRule", "name"))
-        start = fmt_dt_any(node.get("startTime"))
-        end = fmt_dt_any(node.get("endTime"))
-        text = f"**{start} - {end}**\n{rule}\n{s1} / {s2}"
-        img1 = safe_get(setting, "vsStages", 0, "image", "url")
-        img2 = safe_get(setting, "vsStages", 1, "image", "url")
-        if img1 and img2:
-            file = discord.File(await compose_side_by_side(img1, img2), filename="stage.png")
+        pages: list[tuple[discord.Embed, Optional[discord.File]]] = []
+
+        for node in bankara_nodes[:3]:
+            # 設定の取り出しはフォールバック付き
+            setting = (
+                safe_get(node, "bankaraMatchSettings", 0) or
+                safe_get(node, "regularMatchSetting") or
+                {}
+            )
+            s1 = stage_name_ja(safe_get(setting, "vsStages", 0) or {})
+            s2 = stage_name_ja(safe_get(setting, "vsStages", 1) or {})
+            rule = to_ja_rule(safe_get(setting, "vsRule", "name"))
+            start = fmt_dt_any(node.get("startTime"))
+            end = fmt_dt_any(node.get("endTime"))
+            text = f"**{start} - {end}**\n{rule}\n{s1} / {s2}"
+
+            img1 = safe_get(setting, "vsStages", 0, "image", "url")
+            img2 = safe_get(setting, "vsStages", 1, "image", "url")
+
             embed = discord.Embed(description=text)
-            embed.set_image(url="attachment://stage.png")
+            file: Optional[discord.File] = None
+
+            if img1 and img2:
+                try:
+                    buf = await compose_side_by_side(img1, img2)
+                    file = discord.File(buf, filename="stage.png")
+                    embed.set_image(url="attachment://stage.png")
+                except Exception:
+                    log.exception("画像合成に失敗しました。テキストのみで送信します。")
+
             pages.append((embed, file))
+
+        first_embed, first_file = pages[0]
+        if first_file is not None:
+            await interaction.followup.send(embed=first_embed, file=first_file)
         else:
-            embed = discord.Embed(description=text)
-            pages.append((embed, None))
+            await interaction.followup.send(embed=first_embed)
 
-first_embed, first_file = pages[0]
-if first_file is not None:
-    await interaction.followup.send(embed=first_embed, file=first_file)
-else:
-    await interaction.followup.send(embed=first_embed)
+    except Exception:
+        log.exception("/hlt s3 でエラー")
+        await interaction.followup.send("取得中にエラーが発生しました。後でもう一度お試しください。")
 
-
-
-
-
+# ─────────────────────────────
+# エントリポイント
+# ─────────────────────────────
 def main():
     if not TOKEN:
         raise RuntimeError("環境変数 DISCORD_TOKEN が未設定です。")
