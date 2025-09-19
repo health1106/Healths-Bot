@@ -366,8 +366,12 @@ async def hlt_s3(interaction: discord.Interaction):
             embed = discord.Embed(description=text)
             pages.append((embed, None))
 
-    first_embed, first_file = pages[0]
+first_embed, first_file = pages[0]
+if first_file is not None:
     await interaction.followup.send(embed=first_embed, file=first_file)
+else:
+    await interaction.followup.send(embed=first_embed)
+
 
 
 
