@@ -14,6 +14,9 @@ from discord import app_commands
 import asyncpg
 import aiohttp
 
+from typing import Set, Dict  # ← 追記
+from datetime import date, time, timedelta  # ← 追記
+
 # 画像合成（左右配置）に使用
 from PIL import Image
 
@@ -41,6 +44,7 @@ intents.members = True
 intents.messages = True
 intents.message_content = True          # /hlt xp に必要
 intents.guild_scheduled_events = True   # /hlt eventrank に必要
+intents.voice_states = True  # ← 追記（ボイス入退室を拾う）
 
 # ─────────────────────────────
 # メンション抑止
@@ -277,6 +281,51 @@ def build_salmon_page(data: dict, idx: int) -> List[discord.Embed]:
     return embeds
 
 # ─────────────────────────────
+# ボイス計測：メモリ上の状態（グローバル）
+# ─────────────────────────────
+# key = (guild_id, channel_id, user_id) -> start_dt_utc
+voice_sessions: Dict[tuple[int, int, int], datetime] = {}
+# 「今回入室～退出まで 0秒扱い」にするフラグ集合
+zero_mark: Set[tuple[int, int, int]] = set()
+# ギルドごとの対象ボイスチャンネル
+voice_targets: Dict[int, Set[int]] = {}  # {guild_id: {channel_id,...}}
+
+def utcnow() -> datetime:
+    return datetime.now(ZoneInfo("UTC"))
+
+def jst_format(dt_utc: datetime) -> str:
+    return dt_utc.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+def humanize_seconds(total: int) -> str:
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    out = []
+    if h: out.append(f"{h}時間")
+    if m: out.append(f"{m}分")
+    if s or not out: out.append(f"{s}秒")
+    return "".join(out)
+
+# 日付文字列（YYYY-MM-DD）を date に
+def parse_ymd(s: Optional[str]) -> Optional[date]:
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+# JSTの一日（下端/上端）→ UTC の半開区間 [start, end)
+def jst_day_start_utc(d: date) -> datetime:
+    jst_dt = datetime.combine(d, time.min).replace(tzinfo=JST)
+    return jst_dt.astimezone(ZoneInfo("UTC"))
+
+def jst_day_end_exclusive_utc(d: date) -> datetime:
+    jst_dt = datetime.combine(d + timedelta(days=1), time.min).replace(tzinfo=JST)
+    return jst_dt.astimezone(ZoneInfo("UTC"))
+
+
+# ─────────────────────────────
 # Botクラス
 # ─────────────────────────────
 class YadoBot(discord.Client):
@@ -287,22 +336,343 @@ class YadoBot(discord.Client):
         # ギルドごとの XP 参照チャンネル（メモリ保持）
         self.xp_channels: dict[int, int] = {}
 
-    async def setup_hook(self):
-        if not DATABASE_URL:
-            log.warning("DATABASE_URL が未設定です。DBを使うコマンドは失敗します。")
-        else:
-            self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-            async with self.pool.acquire() as conn:
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS guild_settings (
-                        guild_id BIGINT PRIMARY KEY,
-                        intro_channel_id BIGINT NOT NULL,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                """)
-        await self.tree.sync()
+async def setup_hook(self):
+    if not DATABASE_URL:
+        log.warning("DATABASE_URL が未設定です。DBを使うコマンドは失敗します。")
+    else:
+        self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS guild_settings (
+                    guild_id BIGINT PRIMARY KEY,
+                    intro_channel_id BIGINT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS target_voice_channels(
+                    guild_id BIGINT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    PRIMARY KEY(guild_id, channel_id)
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS voice_sessions(
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    start_utc TIMESTAMPTZ NOT NULL,
+                    end_utc   TIMESTAMPTZ NOT NULL
+                );
+            """)
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user ON voice_sessions(guild_id, user_id);")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user_channel ON voice_sessions(guild_id, user_id, channel_id);")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_start ON voice_sessions(guild_id, start_utc);")
+
+    await self.tree.sync()
+
 
 client = YadoBot()
+
+# ─────────────────────────────
+# ボイス計測：DBヘルパー（PostgreSQL / asyncpg）
+# ─────────────────────────────
+async def add_voice_target_channel(gid: int, cid: int):
+    assert client.pool is not None
+    async with client.pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO target_voice_channels(guild_id, channel_id) VALUES($1, $2) ON CONFLICT DO NOTHING;",
+            gid, cid
+        )
+    voice_targets.setdefault(gid, set()).add(cid)
+
+async def load_voice_targets_for_guild(gid: int):
+    voice_targets[gid] = set()
+    if client.pool is None:
+        return
+    async with client.pool.acquire() as conn:
+        rows = await conn.fetch("SELECT channel_id FROM target_voice_channels WHERE guild_id=$1;", gid)
+    voice_targets[gid] = {int(r["channel_id"]) for r in rows}
+
+async def save_voice_session(gid: int, cid: int, uid: int, start_dt_utc: datetime, end_dt_utc: datetime, zero: bool=False):
+    assert client.pool is not None
+    # 0秒扱いなら end = start に揃える
+    if zero:
+        end_dt_utc = start_dt_utc
+    # 0秒以外で end<=start は破棄
+    if not zero and end_dt_utc <= start_dt_utc:
+        return
+    async with client.pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO voice_sessions(guild_id, channel_id, user_id, start_utc, end_utc) VALUES($1,$2,$3,$4,$5);",
+            gid, cid, uid, start_dt_utc, end_dt_utc
+        )
+
+# 日付範囲（JST）を UTC 半開区間に変換
+def build_utc_range(from_str: Optional[str], to_str: Optional[str]) -> tuple[Optional[datetime], Optional[datetime]]:
+    d_from = parse_ymd(from_str)
+    d_to   = parse_ymd(to_str)
+    start_utc = jst_day_start_utc(d_from) if d_from else None
+    end_utc   = jst_day_end_exclusive_utc(d_to) if d_to else None
+    return start_utc, end_utc
+
+# 重なり条件（セッション [start,end) が [S,E) と重なる）: end > S AND start < E
+def overlap_cond_sql(start_utc: Optional[datetime], end_utc: Optional[datetime]) -> tuple[str, list]:
+    conds = []
+    params = []
+    if start_utc is not None:
+        conds.append("end_utc > $X")   # プレースホルダは後で番号を振る
+        params.append(start_utc)
+    if end_utc is not None:
+        conds.append("start_utc < $Y")
+        params.append(end_utc)
+    return (" AND ".join(conds), params)
+
+async def total_seconds_user(gid: int, uid: int, from_str: Optional[str], to_str: Optional[str]) -> int:
+    start_utc, end_utc = build_utc_range(from_str, to_str)
+    base_sql = "SELECT SUM(EXTRACT(EPOCH FROM (end_utc - start_utc))) AS sec FROM voice_sessions WHERE guild_id=$1 AND user_id=$2"
+    params = [gid, uid]
+    cond_sql, extra = overlap_cond_sql(start_utc, end_utc)
+    if cond_sql:
+        cond_sql = cond_sql.replace("$X", f"${len(params)+1}").replace("$Y", f"${len(params)+2}")
+        params.extend(extra)
+        base_sql += " AND " + cond_sql
+    async with client.pool.acquire() as conn:
+        row = await conn.fetchval(base_sql + ";", *params)
+    return int(row or 0)
+
+async def total_seconds_per_channel_user(gid: int, uid: int, limit: int, from_str: Optional[str], to_str: Optional[str]) -> list[tuple[int,int]]:
+    start_utc, end_utc = build_utc_range(from_str, to_str)
+    base_sql = (
+        "SELECT channel_id, SUM(EXTRACT(EPOCH FROM (end_utc - start_utc))) AS sec "
+        "FROM voice_sessions WHERE guild_id=$1 AND user_id=$2"
+    )
+    params = [gid, uid]
+    cond_sql, extra = overlap_cond_sql(start_utc, end_utc)
+    if cond_sql:
+        cond_sql = cond_sql.replace("$X", f"${len(params)+1}").replace("$Y", f"${len(params)+2}")
+        params.extend(extra)
+        base_sql += " AND " + cond_sql
+    base_sql += " GROUP BY channel_id ORDER BY sec DESC NULLS LAST LIMIT $%d;" % (len(params)+1)
+    params.append(limit)
+    async with client.pool.acquire() as conn:
+        rows = await conn.fetch(base_sql, *params)
+    return [(int(r["channel_id"]), int(r["sec"] or 0)) for r in rows]
+
+async def top_users_between(gid: int, limit: int, from_str: Optional[str], to_str: Optional[str]) -> list[tuple[int,int]]:
+    start_utc, end_utc = build_utc_range(from_str, to_str)
+    base_sql = (
+        "SELECT user_id, SUM(EXTRACT(EPOCH FROM (end_utc - start_utc))) AS sec "
+        "FROM voice_sessions WHERE guild_id=$1"
+    )
+    params = [gid]
+    cond_sql, extra = overlap_cond_sql(start_utc, end_utc)
+    if cond_sql:
+        cond_sql = cond_sql.replace("$X", f"${len(params)+1}").replace("$Y", f"${len(params)+2}")
+        params.extend(extra)
+        base_sql += " AND " + cond_sql
+    base_sql += " GROUP BY user_id ORDER BY sec DESC NULLS LAST LIMIT $%d;" % (len(params)+1)
+    params.append(limit)
+    async with client.pool.acquire() as conn:
+        rows = await conn.fetch(base_sql, *params)
+    return [(int(r["user_id"]), int(r["sec"] or 0)) for r in rows]
+
+# ─────────────────────────────
+# /vt ボイス滞在ロガー（新規グループ）
+# ─────────────────────────────
+vt = app_commands.Group(name="vt", description="ボイス滞在時間の記録・集計")
+client.tree.add_command(vt)
+
+@vt.command(name="set-voice", description="計測対象のボイスチャンネルを登録します（管理者）")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(channel="対象ボイスチャンネル")
+@admin_only()
+async def vt_set_voice(interaction: discord.Interaction, channel: discord.VoiceChannel):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    if client.pool is None:
+        return await interaction.response.send_message("設定エラー：DATABASE_URL が未設定です。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await add_voice_target_channel(interaction.guild.id, channel.id)
+    await interaction.followup.send(f"計測対象に {channel.mention} を追加しました。", ephemeral=True)
+
+@vt.command(name="zero", description="現在の入室から退出までを 0秒として記録します（監視/見守り用）")
+async def vt_zero(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    m = interaction.guild.get_member(interaction.user.id)
+    if not m or not m.voice or not m.voice.channel:
+        return await interaction.followup.send("現在ボイスチャンネルに入室していません。", ephemeral=True)
+    gid, cid, uid = interaction.guild.id, m.voice.channel.id, interaction.user.id
+    if cid not in voice_targets.get(gid, set()):
+        return await interaction.followup.send("このチャンネルは計測対象ではありません。/vt set-voice で登録してください。", ephemeral=True)
+    key = (gid, cid, uid)
+    if key not in voice_sessions:  # 参加直後のズレ対策
+        voice_sessions[key] = utcnow()
+    zero_mark.add(key)
+    await interaction.followup.send("この入室からのセッションを **0秒扱い** に設定しました。退出時に0秒で保存します。", ephemeral=True)
+
+@vt.command(name="unzero", description="現在セッションの 0秒扱いを解除します")
+async def vt_unzero(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    m = interaction.guild.get_member(interaction.user.id)
+    if not m or not m.voice or not m.voice.channel:
+        return await interaction.followup.send("現在ボイスチャンネルに入室していません。", ephemeral=True)
+    key = (interaction.guild.id, m.voice.channel.id, interaction.user.id)
+    if key in zero_mark:
+        zero_mark.remove(key)
+        return await interaction.followup.send("0秒扱いを解除しました。", ephemeral=True)
+    return await interaction.followup.send("いまのセッションは 0秒扱いではありません。", ephemeral=True)
+
+# 期間パラメータ（JST）説明を共通化
+_common_range_desc = {"from_": "開始日（YYYY-MM-DD, JST）", "to": "終了日（YYYY-MM-DD, JST）"}
+
+@vt.command(name="my", description="自分の合計滞在時間（期間絞込可）")
+@app_commands.describe(**_common_range_desc)
+async def vt_my(interaction: discord.Interaction, from_: Optional[str] = None, to: Optional[str] = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    sec = await total_seconds_user(interaction.guild.id, interaction.user.id, from_, to)
+    await interaction.followup.send(f"あなたの合計滞在時間：**{humanize_seconds(sec)}**（期間絞込）", ephemeral=True)
+
+@vt.command(name="my-detail", description="自分のチャンネル別上位（期間絞込可）")
+@app_commands.describe(**_common_range_desc)
+async def vt_my_detail(interaction: discord.Interaction, from_: Optional[str] = None, to: Optional[str] = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    rows = await total_seconds_per_channel_user(interaction.guild.id, interaction.user.id, 10, from_, to)
+    if not rows:
+        return await interaction.followup.send("記録がありません（期間や対象を確認）。", ephemeral=True)
+    lines, total = [], 0
+    for ch_id, sec in rows:
+        ch = interaction.guild.get_channel(ch_id)
+        name = ch.name if isinstance(ch, discord.VoiceChannel) else f"#{ch_id}"
+        lines.append(f"・{name}: {humanize_seconds(sec)}")
+        total += sec
+    await interaction.followup.send("**チャンネル別（上位）**\n" + "\n".join(lines) + f"\n合計: {humanize_seconds(total)}", ephemeral=True)
+
+@vt.command(name="user", description="指定ユーザーの合計滞在時間（期間絞込可）")
+@app_commands.describe(member="対象ユーザー", **_common_range_desc)
+async def vt_user(interaction: discord.Interaction, member: discord.Member, from_: Optional[str] = None, to: Optional[str] = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    sec = await total_seconds_user(interaction.guild.id, member.id, from_, to)
+    await interaction.followup.send(f"{member.display_name} の合計滞在時間：**{humanize_seconds(sec)}**（期間絞込）", ephemeral=True)
+
+@vt.command(name="user-detail", description="指定ユーザーのチャンネル別上位（期間絞込可）")
+@app_commands.describe(member="対象ユーザー", **_common_range_desc)
+async def vt_user_detail(interaction: discord.Interaction, member: discord.Member, from_: Optional[str] = None, to: Optional[str] = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    rows = await total_seconds_per_channel_user(interaction.guild.id, member.id, 10, from_, to)
+    if not rows:
+        return await interaction.followup.send("記録がありません（期間や対象を確認）。", ephemeral=True)
+    lines, total = [], 0
+    for ch_id, sec in rows:
+        ch = interaction.guild.get_channel(ch_id)
+        name = ch.name if isinstance(ch, discord.VoiceChannel) else f"#{ch_id}"
+        lines.append(f"・{name}: {humanize_seconds(sec)}")
+        total += sec
+    await interaction.followup.send(f"**{member.display_name} のチャンネル別（上位）**\n" + "\n".join(lines) + f"\n合計: {humanize_seconds(total)}", ephemeral=True)
+
+@vt.command(name="top", description="ランキング（期間絞込可）")
+@app_commands.describe(**_common_range_desc)
+async def vt_top(interaction: discord.Interaction, from_: Optional[str] = None, to: Optional[str] = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    rows = await top_users_between(interaction.guild.id, 10, from_, to)
+    if not rows:
+        return await interaction.followup.send("記録がありません（期間や対象を確認）。", ephemeral=True)
+    lines = []
+    for i, (uid, sec) in enumerate(rows, start=1):
+        m = interaction.guild.get_member(uid)
+        name = m.display_name if m else f"user-{uid}"
+        lines.append(f"{i}. {name} - {humanize_seconds(sec)}")
+    await interaction.followup.send("**ボイス滞在時間ランキング**（期間絞込）\n" + "\n".join(lines), ephemeral=True)
+
+@vt.command(name="export", description="CSV（全員, 期間絞込）を出力")
+@app_commands.describe(**_common_range_desc)
+async def vt_export(interaction: discord.Interaction, from_: Optional[str] = None, to: Optional[str] = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    if client.pool is None:
+        return await interaction.response.send_message("設定エラー：DATABASE_URL が未設定です。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    start_utc, end_utc = build_utc_range(from_, to)
+    base = "SELECT channel_id, user_id, start_utc, end_utc FROM voice_sessions WHERE guild_id=$1"
+    params = [interaction.guild.id]
+    cond, extra = overlap_cond_sql(start_utc, end_utc)
+    if cond:
+        cond = cond.replace("$X", f"${len(params)+1}").replace("$Y", f"${len(params)+2}")
+        params.extend(extra)
+        base += " AND " + cond
+    base += " ORDER BY start_utc;"
+    async with client.pool.acquire() as conn:
+        rows = await conn.fetch(base, *params)
+
+    out = io.StringIO()
+    out.write("channel_id,channel_name,user_id,user_name,start_jst,end_jst,duration_sec\n")
+    for r in rows:
+        ch_id = int(r["channel_id"]); uid = int(r["user_id"])
+        ch = interaction.guild.get_channel(ch_id)
+        ch_name = ch.name if ch else "deleted-or-unavailable"
+        m = interaction.guild.get_member(uid)
+        user_name = m.display_name if m else f"user-{uid}"
+        s = r["start_utc"]; e = r["end_utc"]
+        dur = int((e - s).total_seconds())
+        out.write(f"{ch_id},{ch_name.replace(',',' ')},{uid},{user_name.replace(',',' ')},{jst_format(s)},{jst_format(e)},{dur}\n")
+
+    await interaction.followup.send(
+        content="CSVを書き出しました（期間絞込）。",
+        file=discord.File(io.BytesIO(out.getvalue().encode('utf-8')), filename=f"voice_usage_{interaction.guild.id}.csv"),
+        ephemeral=True
+    )
+
+@vt.command(name="export-user", description="CSV（指定ユーザーのみ, 期間絞込）を出力")
+@app_commands.describe(member="対象ユーザー", **_common_range_desc)
+async def vt_export_user(interaction: discord.Interaction, member: discord.Member, from_: Optional[str] = None, to: Optional[str] = None):
+    if interaction.guild is None:
+        return await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+    if client.pool is None:
+        return await interaction.response.send_message("設定エラー：DATABASE_URL が未設定です。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    start_utc, end_utc = build_utc_range(from_, to)
+    base = "SELECT channel_id, user_id, start_utc, end_utc FROM voice_sessions WHERE guild_id=$1 AND user_id=$2"
+    params = [interaction.guild.id, member.id]
+    cond, extra = overlap_cond_sql(start_utc, end_utc)
+    if cond:
+        cond = cond.replace("$X", f"${len(params)+1}").replace("$Y", f"${len(params)+2}")
+        params.extend(extra)
+        base += " AND " + cond
+    base += " ORDER BY start_utc;"
+    async with client.pool.acquire() as conn:
+        rows = await conn.fetch(base, *params)
+
+    out = io.StringIO()
+    out.write("channel_id,channel_name,user_id,user_name,start_jst,end_jst,duration_sec\n")
+    for r in rows:
+        ch_id = int(r["channel_id"])
+        ch = interaction.guild.get_channel(ch_id)
+        ch_name = ch.name if ch else "deleted-or-unavailable"
+        s = r["start_utc"]; e = r["end_utc"]
+        dur = int((e - s).total_seconds())
+        out.write(f"{ch_id},{ch_name.replace(',',' ')},{member.id},{member.display_name.replace(',',' ')},{jst_format(s)},{jst_format(e)},{dur}\n")
+
+    await interaction.followup.send(
+        content=f"{member.display_name} のCSVを書き出しました（期間絞込）。",
+        file=discord.File(io.BytesIO(out.getvalue().encode('utf-8')), filename=f"voice_usage_{interaction.guild.id}_{member.id}.csv"),
+        ephemeral=True
+    )
+
 
 # ─────────────────────────────
 # /hlt グループ
@@ -793,24 +1163,64 @@ async def hlt_help(interaction: discord.Interaction):
 # ─────────────────────────────
 # イベント
 # ─────────────────────────────
+
+@client.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # BotやDMは除外
+    if member.bot or not member.guild:
+        return
+    gid = member.guild.id
+
+    # キャッシュが無ければロード
+    if gid not in voice_targets:
+        await load_voice_targets_for_guild(gid)
+    targets = voice_targets.get(gid, set())
+
+    # 退出 or 移動 → 旧チャンネルのセッションを終了
+    if before.channel and before.channel.id in targets:
+        key = (gid, before.channel.id, member.id)
+        start = voice_sessions.pop(key, None)
+        z = key in zero_mark
+        zero_mark.discard(key)
+        if start:
+            await save_voice_session(gid, before.channel.id, member.id, start, utcnow(), zero=z)
+
+    # 参加 or 移動 → 新チャンネルのセッションを開始
+    if after.channel and after.channel.id in targets:
+        key = (gid, after.channel.id, member.id)
+        if key not in voice_sessions:  # 二重開始防止
+            voice_sessions[key] = utcnow()
+        # 新規セッションはデフォルトで 0秒扱いOFF
+        zero_mark.discard(key)
+
+
 @client.event
 async def on_ready():
     log.info("Logged in as %s (ID: %s)", client.user, client.user.id)
+    # 追加：起動時に全ギルド分の対象チャンネルをキャッシュ
+    try:
+        for g in client.guilds:
+            await load_voice_targets_for_guild(g.id)
+    except Exception as e:
+        log.warning("load_voice_targets_on_ready failed: %s", e)
+
 
 @client.event
 async def on_guild_join(guild: discord.Guild):
     try:
         existing = await get_intro_channel_id(guild.id)
-        if existing:
-            return
-        candidates = [ch for ch in guild.text_channels if looks_like_intro_name(ch.name)]
-        if candidates:
-            chosen = sorted(candidates, key=lambda c: c.position)[0]
-            if client.pool:
+        if not existing:
+            candidates = [ch for ch in guild.text_channels if looks_like_intro_name(ch.name)]
+            if candidates and client.pool:
+                chosen = sorted(candidates, key=lambda c: c.position)[0]
                 await set_intro_channel(guild.id, chosen.id)
                 log.info("Auto-registered intro channel for guild %s: #%s", guild.id, chosen.name)
     except Exception as e:
         log.warning("on_guild_join auto-set failed for guild %s: %s", guild.id, e)
+
+    await load_voice_targets_for_guild(guild.id)
+
+
 
 # ─────────────────────────────
 # エントリーポイント
