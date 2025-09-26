@@ -333,13 +333,12 @@ class YadoBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.pool: Optional[asyncpg.Pool] = None
-        # ギルドごとの XP 参照チャンネル（メモリ保持）
         self.xp_channels: dict[int, int] = {}
 
-async def setup_hook(self):
-    if not DATABASE_URL:
-        log.warning("DATABASE_URL が未設定です。DBを使うコマンドは失敗します。")
-    else:
+    async def setup_hook(self):  # ← クラス内に入れる
+        if not DATABASE_URL:
+            log.warning("DATABASE_URL が未設定です。DBを使うコマンドは失敗します。")
+        else:
         self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         async with self.pool.acquire() as conn:
             await conn.execute("""
@@ -479,10 +478,10 @@ async def top_users_between(gid: int, limit: int, from_str: Optional[str], to_st
     return [(int(r["user_id"]), int(r["sec"] or 0)) for r in rows]
 
 # ─────────────────────────────
-# /vt ボイス滞在ロガー（新規グループ）
+# /hlt vt（サブグループ）
 # ─────────────────────────────
-vt = app_commands.Group(name="vt", description="ボイス滞在時間の記録・集計")
-client.tree.add_command(vt)
+vt = app_commands.Group(name="vt", description="ボイス滞在時間の記録・集計", parent=hlt)
+
 
 @vt.command(name="set-voice", description="計測対象のボイスチャンネルを登録します（管理者）")
 @app_commands.default_permissions(manage_guild=True)
@@ -1149,16 +1148,25 @@ async def hlt_help(interaction: discord.Interaction):
         "`/hlt auto` …（管理者）自己紹介チャンネルを自動検出して登録\n"
         "`/hlt config` … 現在の設定を表示\n"
         "`/hlt intro @ユーザー` … 登録チャンネルから、指定ユーザーの最新自己紹介を呼び出す\n\n"
-        "`/hlt set-xp #チャンネル` …（管理者）XP参照チャンネルを登録（シンプル版）\n"
-        "`/hlt xp 名前` … 参照チャンネルから『名前を含む行』を検索して引用\n\n"
-        "`/hlt eventrank` … このサーバーのイベントで『興味あり』回数のランキング（10位/ページ、リアクションで操作）\n"
-        "`/hlt eventrank @ユーザー` … 指定ユーザーが『興味あり』を押した回数（数値のみ）を表示\n\n"
-        "`/hlt s3 kind:(schedule|salmon)` … スプラ3スケジュール（各モード2ステージ画像を左右合成／リアクションでページ送り：現在＋3つ先まで／120秒で自動削除）\n"
+        "`/hlt vt set-voice #ボイス` …（管理者）計測対象のボイスチャンネルを登録\n"
+        "`/hlt vt zero` … 現在の入室〜退出を 0秒として記録（監視/見守り用）\n"
+        "`/hlt vt unzero` … 0秒扱いを解除\n"
+        "`/hlt vt my [from] [to]` … 自分の合計滞在時間（JST, YYYY-MM-DD で期間絞込可）\n"
+        "`/hlt vt my-detail [from] [to]` … 自分のチャンネル別上位（期間絞込可）\n"
+        "`/hlt vt user @ユーザー [from] [to]` … 指定ユーザーの合計滞在時間\n"
+        "`/hlt vt user-detail @ユーザー [from] [to]` … 指定ユーザーのチャンネル別上位\n"
+        "`/hlt vt top [from] [to]` … ランキング（期間絞込可）\n"
+        "`/hlt vt export [from] [to]` … CSV（全員, 期間絞込）\n"
+        "`/hlt vt export-user @ユーザー [from] [to]` … CSV（指定ユーザーのみ, 期間絞込）\n\n"
+        "`/hlt eventrank` … サーバーのイベントで『興味あり』回数のランキング\n"
+        "`/hlt eventrank @ユーザー` … 指定ユーザーの『興味あり』回数\n\n"
+        "`/hlt s3 kind:(schedule|salmon)` … スプラ3スケジュール（画像左右合成／ページ送り）\n"
         "※ Botには「View Channel」「Read Message History」「Send Messages」「Embed Links」「Attach Files」「Add Reactions（推奨）」の権限が必要です。\n"
         "※ /hlt xp は Developer Portal の **MESSAGE CONTENT INTENT** をONにしておく必要があります。\n"
         "※ 画像合成には `pillow` が必要です： `pip install pillow`"
     )
     await interaction.response.send_message(text, ephemeral=True)
+
 
 # ─────────────────────────────
 # イベント
