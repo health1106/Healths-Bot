@@ -33,7 +33,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s:%(name)s: %(message)s"
 )
-log = logging.getLogger("yado-bot")
+log = logging.getLogger("healths-bot")
+
 
 # ─────────────────────────────
 # Intents
@@ -72,7 +73,7 @@ def admin_only():
 # ─────────────────────────────
 JST = ZoneInfo("Asia/Tokyo")
 S3_SCHEDULES_URL = "https://splatoon3.ink/data/schedules.json"
-UA = "YadoBot-S3/1.4 (+github.com/yourname)"
+UA = "HealthsBot-S3/1.4 (+github.com/yourname)"
 
 async def fetch_json(url: str) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
@@ -328,51 +329,58 @@ def jst_day_end_exclusive_utc(d: date) -> datetime:
 # ─────────────────────────────
 # Botクラス
 # ─────────────────────────────
-class YadoBot(discord.Client):
+class HealthsBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.pool: Optional[asyncpg.Pool] = None
         self.xp_channels: dict[int, int] = {}
 
-    async def setup_hook(self):  # ← クラス内に入れる
+class HealthsBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.pool: Optional[asyncpg.Pool] = None
+        self.xp_channels: dict[int, int] = {}
+
+    async def setup_hook(self):
         if not DATABASE_URL:
             log.warning("DATABASE_URL が未設定です。DBを使うコマンドは失敗します。")
         else:
-        self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS guild_settings (
-                    guild_id BIGINT PRIMARY KEY,
-                    intro_channel_id BIGINT NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS target_voice_channels(
-                    guild_id BIGINT NOT NULL,
-                    channel_id BIGINT NOT NULL,
-                    PRIMARY KEY(guild_id, channel_id)
-                );
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS voice_sessions(
-                    id BIGSERIAL PRIMARY KEY,
-                    guild_id BIGINT NOT NULL,
-                    channel_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    start_utc TIMESTAMPTZ NOT NULL,
-                    end_utc   TIMESTAMPTZ NOT NULL
-                );
-            """)
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user ON voice_sessions(guild_id, user_id);")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user_channel ON voice_sessions(guild_id, user_id, channel_id);")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_start ON voice_sessions(guild_id, start_utc);")
+            self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+            async with self.pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS guild_settings (
+                        guild_id BIGINT PRIMARY KEY,
+                        intro_channel_id BIGINT NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                """)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS target_voice_channels(
+                        guild_id BIGINT NOT NULL,
+                        channel_id BIGINT NOT NULL,
+                        PRIMARY KEY(guild_id, channel_id)
+                    );
+                """)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS voice_sessions(
+                        id BIGSERIAL PRIMARY KEY,
+                        guild_id BIGINT NOT NULL,
+                        channel_id BIGINT NOT NULL,
+                        user_id BIGINT NOT NULL,
+                        start_utc TIMESTAMPTZ NOT NULL,
+                        end_utc   TIMESTAMPTZ NOT NULL
+                    );
+                """)
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user ON voice_sessions(guild_id, user_id);")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user_channel ON voice_sessions(guild_id, user_id, channel_id);")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_start ON voice_sessions(guild_id, start_utc);")
 
-    await self.tree.sync()
+        await self.tree.sync()
 
 
-client = YadoBot()
+client = HealthsBot()
 
 # ─────────────────────────────
 # ボイス計測：DBヘルパー（PostgreSQL / asyncpg）
@@ -478,10 +486,15 @@ async def top_users_between(gid: int, limit: int, from_str: Optional[str], to_st
     return [(int(r["user_id"]), int(r["sec"] or 0)) for r in rows]
 
 # ─────────────────────────────
+# /hlt グループ
+# ─────────────────────────────
+hlt = app_commands.Group(name="hlt", description="ヘルパーコマンド集")
+client.tree.add_command(hlt)
+
+# ─────────────────────────────
 # /hlt vt（サブグループ）
 # ─────────────────────────────
 vt = app_commands.Group(name="vt", description="ボイス滞在時間の記録・集計", parent=hlt)
-
 
 @vt.command(name="set-voice", description="計測対象のボイスチャンネルを登録します（管理者）")
 @app_commands.default_permissions(manage_guild=True)
@@ -673,11 +686,6 @@ async def vt_export_user(interaction: discord.Interaction, member: discord.Membe
     )
 
 
-# ─────────────────────────────
-# /hlt グループ
-# ─────────────────────────────
-hlt = app_commands.Group(name="hlt", description="ヘルパーコマンド集")
-client.tree.add_command(hlt)
 
 # ─────────────────────────────
 # 自己紹介設定（DB）
@@ -1143,7 +1151,7 @@ async def hlt_s3(interaction: discord.Interaction, kind: app_commands.Choice[str
 @hlt.command(name="help", description="コマンドの使い方を表示します。")
 async def hlt_help(interaction: discord.Interaction):
     text = (
-        "**Yado Bot - ヘルプ**\n"
+        "**Health'sBot - ヘルプ**\n"
         "`/hlt set-intro #チャンネル` …（管理者）自己紹介チャンネルを登録\n"
         "`/hlt auto` …（管理者）自己紹介チャンネルを自動検出して登録\n"
         "`/hlt config` … 現在の設定を表示\n"
