@@ -5,39 +5,58 @@ from typing import Optional, Dict, Set, List
 import json
 import os
 
-# 権限データを保存するJSONファイルのパス
-PERMISSION_FILE = "authorized_users.json"
+# 設定データを保存するJSONファイルのパス
+SETTINGS_FILE = "bot_settings.json"
 
-def load_permissions() -> Dict[int, Set[int]]:
-    """JSONファイルから権限データを読み込む関数"""
-    if not os.path.exists(PERMISSION_FILE):
-        return {}
+def load_settings() -> dict:
+    """JSONファイルからすべての設定データを読み込む関数"""
+    if not os.path.exists(SETTINGS_FILE):
+        return {"authorized_users": {}, "target_channels": {}}
     try:
-        with open(PERMISSION_FILE, "r", encoding="utf-8") as f:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # JSONのキー(文字列)をギルドID(int)に、値(リスト)をユーザーIDのセット(set)に変換
-            return {int(gid): set(uids) for gid, uids in data.items()}
+            
+            # データの初期構造を保証
+            if "authorized_users" not in data:
+                data["authorized_users"] = {}
+            if "target_channels" not in data:
+                data["target_channels"] = {}
+                
+            # JSONのキー(文字列)をギルドID(int)に、権限リストをセット(set)に変換
+            auth_users = {int(gid): set(uids) for gid, uids in data["authorized_users"].items()}
+            # チャンネルIDもギルドID(int)、チャンネルID(int)に変換
+            target_chs = {int(gid): int(ch_id) for gid, ch_id in data["target_channels"].items()}
+            
+            return {"authorized_users": auth_users, "target_channels": target_chs}
     except Exception as e:
-        print(f"権限データの読み込みエラー: {e}")
-        return {}
+        print(f"設定データの読み込みエラー: {e}")
+        return {"authorized_users": {}, "target_channels": {}}
 
-def save_permissions(authorized_users: Dict[int, Set[int]]):
-    """権限データをJSONファイルに書き込む関数"""
+def save_settings(authorized_users: Dict[int, Set[int]], target_channels: Dict[int, int]):
+    """設定データをまとめてJSONファイルに書き込む関数"""
     try:
-        # set型はJSON化できないため、list型に変換して保存
-        data = {str(gid): list(uids) for gid, uids in authorized_users.items()}
-        with open(PERMISSION_FILE, "w", encoding="utf-8") as f:
+        # set型やint型のキーをJSONで扱える形式（listや文字列キー）に変換
+        data = {
+            "authorized_users": {str(gid): list(uids) for gid, uids in authorized_users.items()},
+            "target_channels": {str(gid): ch_id for gid, ch_id in target_channels.items()}
+        }
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
-        print(f"権限データの保存エラー: {e}")
+        print(f"設定データの保存エラー: {e}")
 
 class Communicate(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         
-        # Bot起動時にファイルからデータを読み込んで保持させる
+        # Bot起動時にファイルからデータを一度だけ読み込んで保持させる
+        settings = load_settings()
+        
         if not hasattr(self.bot, "authorized_users") or not self.bot.authorized_users:
-            self.bot.authorized_users = load_permissions()
+            self.bot.authorized_users = settings["authorized_users"]
+            
+        if not hasattr(self.bot, "target_channels") or not self.bot.target_channels:
+            self.bot.target_channels = settings["target_channels"]
 
     # 親グループ /set
     set_group = app_commands.Group(name="set", description="HealthsBotの各種設定を行います")
@@ -61,8 +80,8 @@ class Communicate(commands.Cog):
         # メモリ（変数）に追加
         self.bot.authorized_users[gid].add(user.id)
         
-        # ファイルに即座に保存（永続化）
-        save_permissions(self.bot.authorized_users)
+        # 設定ファイルに保存
+        save_settings(self.bot.authorized_users, self.bot.target_channels)
         
         await interaction.response.send_message(f"{user.mention} にHealthsBotの全コマンド実行権限を付与しました。", ephemeral=True)
 
@@ -75,7 +94,12 @@ class Communicate(commands.Cog):
             await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
             return
 
+        # メモリ（変数）に追加
         self.bot.target_channels[interaction.guild_id] = channel.id
+        
+        # 設定ファイルに保存
+        save_settings(self.bot.authorized_users, self.bot.target_channels)
+        
         await interaction.response.send_message(f"検索対象チャンネルを {channel.mention} に設定しました。", ephemeral=True)
 
     # --- 表示コマンド (/自己紹介 ...) ---
@@ -85,7 +109,7 @@ class Communicate(commands.Cog):
     async def get_intro(self, interaction: discord.Interaction, user: discord.User):
         gid = interaction.guild_id
         if gid not in self.bot.target_channels:
-            await interaction.response.send_message("対象のチャンネルが設定されていません。管理者に `/hlt ch` での設定を依頼してください。", ephemeral=True)
+            await interaction.response.send_message("対象のチャンネルが設定されていません。管理者に `/set 自己紹介 ch` での設定を依頼してください。", ephemeral=True)
             return
 
         target_ch_id = self.bot.target_channels[gid]
