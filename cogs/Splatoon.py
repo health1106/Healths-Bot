@@ -42,14 +42,12 @@ async def stage_autocomplete(interaction: discord.Interaction, current: str) -> 
             for line in lines:
                 stage_name = line.strip()
                 if stage_name:
-                    # ユーザーが入力中の文字(current)が含まれるもの、または入力が空のときに対象とする
                     if current.lower() in stage_name.lower():
                         stages.append(app_commands.Choice(name=stage_name, value=stage_name))
     except Exception as e:
         print(f"ステージオートコンプリートエラー: {e}")
         return []
 
-    # Discordの仕様上、返せる候補は最大25個まで
     return stages[:25]
 
 
@@ -85,7 +83,6 @@ class Splatoon(commands.Cog):
         mode_name = mode.name
         rule_name = rule.name
         
-        # ステージ表示の整形（stage2がある場合は「ステージ1 〜 ステージ2」にする）
         if stage2:
             stage_display = f"{stage1} 〜 {stage2}"
         else:
@@ -98,7 +95,6 @@ class Splatoon(commands.Cog):
             color=discord.Color.blue()
         )
         
-        # 募集内容をフィールドに分けて見やすく整理
         embed.add_field(name="📝 モード", value=mode_name, inline=True)
         embed.add_field(name="🏆 ルール", value=rule_name, inline=True)
         embed.add_field(name="👥 募集人数", value=f"**{人数}** 人", inline=True)
@@ -106,7 +102,18 @@ class Splatoon(commands.Cog):
         
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         
+        # 1. 募集メッセージを送信し、送信されたメッセージオブジェクトを取得
         await interaction.response.send_message(embed=embed)
+        response_msg = await interaction.original_response()
+        
+        # 2. 送信したメッセージの下に自動でスレッドを作成
+        try:
+            await response_msg.create_thread(
+                name="参加希望はこちら！",
+                auto_archive_duration=60 # 1時間（60分）非アクティブで自動アーカイブ
+            )
+        except Exception as e:
+            print(f"スレッド作成エラー: {e}")
 
     # stage1の引数にオートコンプリートを適用
     @recruit.autocomplete("stage1")
