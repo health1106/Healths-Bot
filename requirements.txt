@@ -17,3 +17,4 @@ python-dotenv==1.2.2
 pytube==15.0.0
 setuptools==79.0.1
 yarl==1.23.0
+Flask==3.1.0
