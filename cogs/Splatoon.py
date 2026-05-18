@@ -83,18 +83,20 @@ class Splatoon(commands.Cog):
         mode_name = mode.name
         rule_name = rule.name
         
+        # ステージ表示を「・」から始まる2段（改行）に整形
         if stage2:
-            stage_display = f"{stage1} 〜 {stage2}"
+            stage_display = f"・{stage1}\n・{stage2}"
         else:
-            stage_display = stage1
+            stage_display = f"・{stage1}"
         
         # 埋め込みメッセージの作成
         embed = discord.Embed(
             title="🎮 スプラ3 メンバー募集！",
-            description=f"{interaction.user.mention} がメンバーを募集しています！\n参加したい方は下記のスレッドで参加表明してみましょう！",
+            description=f"{interaction.user.mention} がメンバーを募集しています！\n参加したい方はVCへどうぞ！",
             color=discord.Color.blue()
         )
         
+        # 募集内容をフィールドに分けて見やすく整理
         embed.add_field(name="📝 モード", value=mode_name, inline=True)
         embed.add_field(name="🏆 ルール", value=rule_name, inline=True)
         embed.add_field(name="👥 募集人数", value=f"**{人数}** 人", inline=True)
