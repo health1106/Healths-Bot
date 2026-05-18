@@ -2,10 +2,42 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from typing import Optional, Dict, Set, List
+import json
+import os
+
+# 権限データを保存するJSONファイルのパス
+PERMISSION_FILE = "authorized_users.json"
+
+def load_permissions() -> Dict[int, Set[int]]:
+    """JSONファイルから権限データを読み込む関数"""
+    if not os.path.exists(PERMISSION_FILE):
+        return {}
+    try:
+        with open(PERMISSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # JSONのキー(文字列)をギルドID(int)に、値(リスト)をユーザーIDのセット(set)に変換
+            return {int(gid): set(uids) for gid, uids in data.items()}
+    except Exception as e:
+        print(f"権限データの読み込みエラー: {e}")
+        return {}
+
+def save_permissions(authorized_users: Dict[int, Set[int]]):
+    """権限データをJSONファイルに書き込む関数"""
+    try:
+        # set型はJSON化できないため、list型に変換して保存
+        data = {str(gid): list(uids) for gid, uids in authorized_users.items()}
+        with open(PERMISSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"権限データの保存エラー: {e}")
 
 class Communicate(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        
+        # Bot起動時にファイルからデータを読み込んで保持させる
+        if not hasattr(self.bot, "authorized_users") or not self.bot.authorized_users:
+            self.bot.authorized_users = load_permissions()
 
     # 親グループ /set
     set_group = app_commands.Group(name="set", description="HealthsBotの各種設定を行います")
@@ -26,7 +58,12 @@ class Communicate(commands.Cog):
         if gid not in self.bot.authorized_users:
             self.bot.authorized_users[gid] = set()
         
+        # メモリ（変数）に追加
         self.bot.authorized_users[gid].add(user.id)
+        
+        # ファイルに即座に保存（永続化）
+        save_permissions(self.bot.authorized_users)
+        
         await interaction.response.send_message(f"{user.mention} にHealthsBotの全コマンド実行権限を付与しました。", ephemeral=True)
 
     # --- 設定コマンド (/set 自己紹介 ch) ---
