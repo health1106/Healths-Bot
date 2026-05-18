@@ -3,17 +3,18 @@ import asyncio
 import logging
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
+# Typing用の型定義をインポート
+from typing import Dict, Set
 
-# 1. 環境変数の読み込み
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-DEV_ID_STR = os.getenv("DEVELOPER_ID")
-DEVELOPER_ID = int(DEV_ID_STR) if DEV_ID_STR and DEV_ID_STR.isdigit() else None
-
-# 2. ロギングの設定（デバッグに便利）
+# 1. ロギングの設定（デバッグに便利）
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 log = logging.getLogger("bot")
+
+# 2. 環境変数の読み込み（RenderのEnvironment設定から取得します）
+TOKEN = os.getenv("DISCORD_TOKEN")
+# 型エラーを防ぐため、IDは整数型に変換（設定されていない場合はNone）
+DEVELOPER_ID_ENV = os.getenv("DEVELOPER_ID")
+DEVELOPER_ID = int(DEVELOPER_ID_ENV) if DEVELOPER_ID_ENV else None
 
 # 3. インテントの設定（必要最小限）
 intents = discord.Intents.default()
@@ -54,9 +55,11 @@ class MyBot(commands.Bot):
 
     async def setup_hook(self):
         # cogs フォルダ内のファイルを自動的に読み込む
-        for filename in os.listdir("./cogs"):
-            if filename.endswith(".py"):
-                await self.load_extension(f"cogs.{filename[:-3]}")
+        # ※cogsフォルダが存在しない場合のエラーを防ぐ判定を追加
+        if os.path.exists("./cogs"):
+            for filename in os.listdir("./cogs"):
+                if filename.endswith(".py"):
+                    await self.load_extension(f"cogs.{filename[:-3]}")
         
         # スラッシュコマンドを Discord に同期
         await self.tree.sync()
@@ -67,14 +70,8 @@ async def main():
         await bot.start(TOKEN)
 
 if __name__ == "__main__":
-    try:
-        if not TOKEN:
-            print("Error: DISCORD_TOKEN が設定されていません。.env ファイルを確認してください。")
-        else:
-            asyncio.run(main())
-    except Exception as e:
-        print(f"エラーが発生しました:\n{e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        input("\nEnterキーを押すと終了します...")
+    if not TOKEN:
+        print("Error: DISCORD_TOKEN が設定されていません。RenderのEnvironment設定を確認してください。")
+    else:
+        # Render（Linux環境）で動かすため、最後のinput()による待機を削除
+        asyncio.run(main())
