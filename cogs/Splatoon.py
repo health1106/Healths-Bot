@@ -91,7 +91,7 @@ class Splatoon(commands.Cog):
         # 埋め込みメッセージの作成
         embed = discord.Embed(
             title="🎮 スプラ3 メンバー募集！",
-            description=f"{interaction.user.mention} がメンバーを募集しています！\n参加したい方はVCへどうぞ！",
+            description=f"{interaction.user.mention} がメンバーを募集しています！\n参加したい方は下記のスレッドで参加表明してみましょう！",
             color=discord.Color.blue()
         )
         
