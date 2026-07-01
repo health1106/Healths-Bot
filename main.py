@@ -4,7 +4,7 @@ import logging
 import discord
 from discord.ext import commands
 from typing import Dict, Set
-# Webサーバーを立ち上げるためのライブラリ（Renderのタイムアウト対策）
+# Webサーバーを立ち上げるためのライブラリ（Renderのスリープ・タイムアウト対策）
 from flask import Flask
 from threading import Thread
 
@@ -31,21 +31,21 @@ intents = discord.Intents.default()
 intents.message_content = True  # メッセージの内容を読み取る権限を有効化
 
 # ==========================================
-# 4. Renderのタイムアウトを回避するWebサーバー設定
+# 4. Renderのタイムアウト・スリープを回避するWebサーバー設定
 # ==========================================
 # 空のFlaskアプリ（ミニWebサーバー）のインスタンスを作成
 app = Flask("")
 
-# サーバーのトップページ（ / ）にアクセスがあったときの処理
+# UptimeRobotなどの監視サービスがアクセス（/）してきたときに「200 OK」を返す処理
 @app.route("/")
 def home():
-    # Renderの生存確認に対して「動いてるよ」とテキストを返す
-    return "Bot is alive!"
+    # 正常に稼働していることをテキストで返す（UptimeRobotがこれを検知して「Up」と判定します）
+    return "Bot is safe and sound! Powered by Render."
 
 def run_web_server():
     # Renderは標準で10000番ポートを使用するため、環境変数からポート番号を取得（なければ10000番）
     port = int(os.environ.get("PORT", 10000))
-    # 外部からのアクセスを許可する設定でWebサーバーを起動
+    # 外部からのアクセス（0.0.0.0）を許可する設定でWebサーバーを起動
     app.run(host="0.0.0.0", port=port)
 
 def keep_alive():
@@ -130,4 +130,5 @@ if __name__ == "__main__":
         # 裏側でタイムアウト回避用のWebサーバーを起動
         keep_alive()
         # Discord Botの非同期メインループを実行・維持
-        asyncio.run(main())
+        async with asyncio.Runner() as runner:
+            runner.run(main())
