@@ -130,5 +130,4 @@ if __name__ == "__main__":
         # 裏側でタイムアウト回避用のWebサーバーを起動
         keep_alive()
         # Discord Botの非同期メインループを実行・維持
-        async with asyncio.Runner() as runner:
-            runner.run(main())
+        asyncio.run(main())
